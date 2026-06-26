@@ -172,37 +172,64 @@ prompt_token() {
 }
 
 # ---- package install -------------------------------------------------------
+# OpenWrt 24.10+ migrated from opkg to apk (Alpine Package Keeper). We detect
+# what's actually present and call the matching commands. Package names are
+# identical between the two on OpenWrt, so only the verbs change.
+PKG_MGR=""
+pkg_is_installed() {
+  case "$PKG_MGR" in
+    apk)  apk info -e "$1" >/dev/null 2>&1 ;;
+    opkg) opkg list-installed 2>/dev/null | grep -q "^$1 " ;;
+  esac
+}
+pkg_install_one() {
+  case "$PKG_MGR" in
+    apk)  apk add "$1" >/dev/null 2>&1 ;;
+    opkg) opkg install "$1" >/dev/null 2>&1 ;;
+  esac
+}
+pkg_update_index() {
+  case "$PKG_MGR" in
+    apk)  apk update >/dev/null 2>&1 ;;
+    opkg) opkg update >/dev/null 2>&1 ;;
+  esac
+}
+
 install_packages() {
   step "Установка системных пакетов"
-  if ! command -v opkg >/dev/null 2>&1; then
-    die "opkg не найден. Этот установщик рассчитан на OpenWrt/ImmortalWrt. На других системах поставь xray-core и lighttpd вручную и запусти install.sh с --skip-packages."
+  if command -v apk >/dev/null 2>&1; then
+    PKG_MGR=apk
+    ok "пакетный менеджер: apk (OpenWrt 24.10+)"
+  elif command -v opkg >/dev/null 2>&1; then
+    PKG_MGR=opkg
+    ok "пакетный менеджер: opkg"
+  else
+    die "Ни apk, ни opkg не найден. Этот установщик рассчитан на OpenWrt/ImmortalWrt."
   fi
 
-  step "opkg update"
-  if ! opkg update 2>&1 | grep -q "Updated source\|Downloading"; then
-    warn "opkg update вернул необычный вывод — продолжаю, но возможны проблемы с резолвингом пакетов."
-  fi
+  step "Обновление списка пакетов"
+  pkg_update_index || warn "не удалось обновить индекс — продолжаем"
 
   missing=""
   for pkg in $REQUIRED_PKGS; do
-    if opkg list-installed | grep -q "^$pkg "; then
+    if pkg_is_installed "$pkg"; then
       ok "$pkg (уже стоит)"
       continue
     fi
-    if opkg install "$pkg" >/dev/null 2>&1; then
+    if pkg_install_one "$pkg"; then
       ok "$pkg"
     else
       missing="$missing $pkg"
     fi
   done
   if [ -n "$missing" ]; then
-    die "Не удалось установить обязательные пакеты:$missing. Проверь интернет/репозитории opkg и повтори."
+    die "Не удалось установить обязательные пакеты:$missing. Проверь интернет/репозитории и повтори."
   fi
 
   for pkg in $OPTIONAL_PKGS; do
-    if opkg list-installed | grep -q "^$pkg "; then
+    if pkg_is_installed "$pkg"; then
       ok "$pkg (опц., уже стоит)"
-    elif opkg install "$pkg" >/dev/null 2>&1; then
+    elif pkg_install_one "$pkg"; then
       ok "$pkg (опц.)"
     else
       warn "не удалось установить $pkg (опционально, пропускаю)"
