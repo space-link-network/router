@@ -1,0 +1,401 @@
+#!/bin/sh
+# Space Link Router installer. POSIX sh, runs in BusyBox.
+# Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
+set -eu
+
+VERSION="0.1.0"
+# GitLab "permalink/latest" resolves to the most recent release of the public
+# project and exposes each release asset at /downloads/<asset-name>.
+RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
+CLOUD_API="${CLOUD_API:-https://api.space-link.app/api/v1}"
+STATE_DIR="/etc/space-link"
+INSTALL_DIR="/opt/space-link"
+WWW_DIR="$INSTALL_DIR/www"
+RULES_DIR="$INSTALL_DIR/rules"
+BIN_PATH="$INSTALL_DIR/space-link-api"
+
+# Packages we hard-require: install must abort if any is missing.
+REQUIRED_PKGS="ca-certificates curl xray-core lighttpd lighttpd-mod-proxy lighttpd-mod-rewrite lighttpd-mod-redirect"
+# Optional pkgs — install if available, warn-only on failure.
+OPTIONAL_PKGS="kmod-tun"
+
+# Resolve script dir so the bundled installer (run from a worktree or
+# /tmp extraction) can find ./lib and ./templates. When piped via wget,
+# we fall back to downloading them.
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0" 2>/dev/null || echo .)" && pwd 2>/dev/null || echo /tmp)
+
+# ---- CLI args --------------------------------------------------------------
+TOKEN=""
+SKIP_TOKEN=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --token)
+      shift
+      TOKEN="${1:-}"
+      ;;
+    --token=*)
+      TOKEN="${1#--token=}"
+      ;;
+    --skip-token)
+      SKIP_TOKEN=1
+      ;;
+    --help|-h)
+      cat <<EOF
+Space Link Router installer
+
+Usage:
+  install.sh [--token <value>] [--skip-token]
+
+Options:
+  --token <value>   Pre-set the Space Link cloud token (non-interactive).
+  --skip-token      Skip the token prompt entirely (configure later in UI).
+  -h, --help        Show this help and exit.
+EOF
+      exit 0
+      ;;
+  esac
+  shift || true
+done
+
+# ---- helpers ---------------------------------------------------------------
+if [ -f "$SCRIPT_DIR/lib/colors.sh" ]; then
+  . "$SCRIPT_DIR/lib/colors.sh"
+  . "$SCRIPT_DIR/lib/arch-detect.sh"
+  . "$SCRIPT_DIR/lib/api-client.sh"
+else
+  # Minimal fallback when piped from network (lib/ not next to us).
+  step()  { printf '==> %s\n' "$1"; }
+  ok()    { printf 'OK  %s\n' "$1"; }
+  warn()  { printf 'WRN %s\n' "$1"; }
+  err()   { printf 'ERR %s\n' "$1" 1>&2; }
+  die()   { err "$1"; exit "${2:-1}"; }
+  banner() { printf '\n  Space Link Router\n\n'; }
+  detect_arch() {
+    case "$(uname -m 2>/dev/null)" in
+      aarch64|arm64) echo aarch64 ;;
+      armv7l|armv7|armhf) echo armv7 ;;
+      mipsel|mips|mips64el) echo mipsel ;;
+      *) echo unknown ;;
+    esac
+  }
+  validate_token() {
+    [ -z "${1:-}" ] && return 2
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsS -m 10 -H "Authorization: Bearer $1" "$CLOUD_API/router/validate" >/dev/null 2>&1
+    else
+      wget -q --timeout=10 --header="Authorization: Bearer $1" -O- "$CLOUD_API/router/validate" >/dev/null 2>&1
+    fi
+  }
+fi
+
+# ---- detection mode --------------------------------------------------------
+mode="first_install"
+if [ -f "$STATE_DIR/version" ]; then
+  prev=$(cat "$STATE_DIR/version" 2>/dev/null || echo "")
+  if [ "$prev" = "$VERSION" ]; then
+    mode="repair"
+  else
+    mode="update"
+  fi
+fi
+
+# ---- preflight -------------------------------------------------------------
+preflight() {
+  step "Проверки окружения"
+
+  if [ ! -f /etc/openwrt_release ]; then
+    warn "Не обнаружен /etc/openwrt_release — установка возможно не на OpenWrt. Продолжаем."
+  else
+    ok "OpenWrt"
+  fi
+
+  if command -v ping >/dev/null 2>&1; then
+    if ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1; then
+      ok "Интернет"
+    else
+      die "Нет интернета. Проверьте подключение."
+    fi
+  fi
+
+  ARCH=$(detect_arch)
+  if [ "$ARCH" = "unknown" ]; then
+    die "Неизвестная архитектура: $(uname -m)"
+  fi
+  ok "Архитектура: $ARCH"
+}
+
+# ---- token prompt ----------------------------------------------------------
+prompt_token() {
+  # During update/repair we keep whatever token was already saved.
+  [ "$mode" = "first_install" ] || return 0
+
+  # If user passed --token on the command line, validate and we're done.
+  if [ -n "$TOKEN" ]; then
+    step "Токен передан в аргументах — проверяю"
+    if validate_token "$TOKEN"; then ok "Токен принят"
+    else warn "Токен не прошёл проверку. Сохраняю как есть — можно заменить в UI."
+    fi
+    return 0
+  fi
+  if [ "$SKIP_TOKEN" = "1" ]; then
+    printf 'Токен пропущен (--skip-token). Настройте позже: http://my.spacelink/\n'
+    return 0
+  fi
+
+  # Decide which fd to read from. `wget | sh` has stdin bound to the pipe —
+  # so we fall back to /dev/tty when stdin isn't a terminal. If neither is
+  # available, skip silently.
+  if [ -t 0 ]; then
+    _tty_in="/dev/stdin"
+  elif [ -r /dev/tty ]; then
+    _tty_in="/dev/tty"
+  else
+    printf '\nНет терминала для ввода токена. Открой http://my.spacelink/ и введи токен или ссылку подписки в разделе Setup.\n'
+    return 0
+  fi
+
+  printf '\n'
+  printf 'Token (Enter to skip): '
+  # POSIX read from the chosen fd.
+  read -r TOKEN < "$_tty_in" || TOKEN=""
+
+  if [ -n "$TOKEN" ]; then
+    step "Проверка токена..."
+    if validate_token "$TOKEN"; then
+      ok "Токен принят"
+    else
+      warn "Токен не прошёл проверку. Сохраняю как есть — можно заменить позже в UI."
+    fi
+  else
+    printf 'Пропущено. Открой http://my.spacelink/ и введи токен или ссылку подписки в Setup.\n'
+  fi
+}
+
+# ---- package install -------------------------------------------------------
+install_packages() {
+  step "Установка системных пакетов"
+  if ! command -v opkg >/dev/null 2>&1; then
+    die "opkg не найден. Этот установщик рассчитан на OpenWrt/ImmortalWrt. На других системах поставь xray-core и lighttpd вручную и запусти install.sh с --skip-packages."
+  fi
+
+  step "opkg update"
+  if ! opkg update 2>&1 | grep -q "Updated source\|Downloading"; then
+    warn "opkg update вернул необычный вывод — продолжаю, но возможны проблемы с резолвингом пакетов."
+  fi
+
+  missing=""
+  for pkg in $REQUIRED_PKGS; do
+    if opkg list-installed | grep -q "^$pkg "; then
+      ok "$pkg (уже стоит)"
+      continue
+    fi
+    if opkg install "$pkg" >/dev/null 2>&1; then
+      ok "$pkg"
+    else
+      missing="$missing $pkg"
+    fi
+  done
+  if [ -n "$missing" ]; then
+    die "Не удалось установить обязательные пакеты:$missing. Проверь интернет/репозитории opkg и повтори."
+  fi
+
+  for pkg in $OPTIONAL_PKGS; do
+    if opkg list-installed | grep -q "^$pkg "; then
+      ok "$pkg (опц., уже стоит)"
+    elif opkg install "$pkg" >/dev/null 2>&1; then
+      ok "$pkg (опц.)"
+    else
+      warn "не удалось установить $pkg (опционально, пропускаю)"
+    fi
+  done
+}
+
+# ---- download artifacts ----------------------------------------------------
+fetch() {
+  url="$1"; out="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL -o "$out" "$url"
+  else
+    wget -q -O "$out" "$url"
+  fi
+}
+
+install_binary() {
+  step "Загрузка space-link-api ($ARCH)"
+  mkdir -p "$INSTALL_DIR"
+  url="$RELEASE_BASE/space-link-api-$ARCH"
+  fetch "$url" "$BIN_PATH.new" || die "Не удалось скачать $url"
+  chmod 0755 "$BIN_PATH.new"
+  mv "$BIN_PATH.new" "$BIN_PATH"
+  ok "$BIN_PATH"
+}
+
+install_ui() {
+  step "Загрузка UI bundle"
+  mkdir -p "$WWW_DIR"
+  fetch "$RELEASE_BASE/ui.tar.gz" /tmp/space-link-ui.tar.gz || die "Не удалось скачать ui.tar.gz"
+  tar -xzf /tmp/space-link-ui.tar.gz -C "$WWW_DIR"
+  rm -f /tmp/space-link-ui.tar.gz
+  ok "$WWW_DIR"
+}
+
+install_rules() {
+  step "Установка пресетов маршрутизации"
+  mkdir -p "$RULES_DIR/presets"
+  if [ -d "$SCRIPT_DIR/../rules/presets" ]; then
+    cp "$SCRIPT_DIR/../rules/presets"/*.txt "$RULES_DIR/presets/" 2>/dev/null || true
+  else
+    for preset in ru cis; do
+      fetch "$RELEASE_BASE/rules-$preset.txt" "$RULES_DIR/presets/$preset.txt" 2>/dev/null \
+        || warn "пресет $preset не скачался — не критично, можно выбрать позже"
+    done
+  fi
+  ok "$RULES_DIR"
+}
+
+# ---- templates -------------------------------------------------------------
+install_templates() {
+  step "Установка конфигов"
+
+  # lighttpd
+  if [ -f "$SCRIPT_DIR/../templates/lighttpd.conf" ]; then
+    cp "$SCRIPT_DIR/../templates/lighttpd.conf" /etc/lighttpd/conf.d/space-link.conf
+  else
+    fetch "$RELEASE_BASE/lighttpd.conf" /etc/lighttpd/conf.d/space-link.conf || warn "lighttpd.conf пропущен"
+  fi
+  ok "lighttpd"
+
+  # init.d
+  if [ -f "$SCRIPT_DIR/../templates/space-link.init" ]; then
+    cp "$SCRIPT_DIR/../templates/space-link.init" /etc/init.d/space-link
+  else
+    fetch "$RELEASE_BASE/space-link.init" /etc/init.d/space-link || warn "init script пропущен"
+  fi
+  chmod 0755 /etc/init.d/space-link
+  ok "init.d"
+}
+
+# ---- enable services -------------------------------------------------------
+enable_services() {
+  step "Включение сервисов"
+
+  # xray — ставим минимальный заглушечный конфиг, чтобы init.d не падал
+  # до того, как Go API отрендерит реальный config.json с активным сервером.
+  if [ ! -s /etc/xray/config.json ]; then
+    mkdir -p /etc/xray
+    printf '%s\n' '{"inbounds":[],"outbounds":[{"protocol":"freedom","tag":"direct"}]}' > /etc/xray/config.json
+  fi
+  /etc/init.d/xray enable >/dev/null 2>&1 || true
+  /etc/init.d/xray restart >/dev/null 2>&1 || /etc/init.d/xray start >/dev/null 2>&1 \
+    || warn "xray не стартовал — посмотри logread -e xray"
+
+  /etc/init.d/space-link enable >/dev/null 2>&1 || true
+  /etc/init.d/space-link restart >/dev/null 2>&1 || /etc/init.d/space-link start >/dev/null 2>&1 \
+    || warn "space-link не стартовал — посмотри logread -e space-link"
+
+  /etc/init.d/lighttpd enable >/dev/null 2>&1 || true
+  /etc/init.d/lighttpd restart >/dev/null 2>&1 || /etc/init.d/lighttpd start >/dev/null 2>&1 \
+    || warn "lighttpd не стартовал — посмотри logread -e lighttpd"
+
+  ok "сервисы"
+}
+
+# ---- save state ------------------------------------------------------------
+save_state() {
+  mkdir -p "$STATE_DIR"
+  chmod 0755 "$STATE_DIR"
+  if [ -n "$TOKEN" ]; then
+    umask 077
+    printf '%s\n' "$TOKEN" > "$STATE_DIR/token"
+    chmod 0600 "$STATE_DIR/token"
+    printf '%s\n' "token" > "$STATE_DIR/mode"
+    chmod 0644 "$STATE_DIR/mode"
+    umask 022
+
+    # Best-effort: if the local API is already up, POST the token so it picks
+    # it up without a restart. Failure is fine — the file on disk is the truth.
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsS -m 5 -X POST -H 'Content-Type: application/json' \
+        --data "{\"token\":\"$TOKEN\"}" \
+        http://127.0.0.1:8080/api/local/token >/dev/null 2>&1 || true
+    fi
+  fi
+  printf '%s\n' "$VERSION" > "$STATE_DIR/version"
+  date '+%Y-%m-%dT%H:%M:%S' > "$STATE_DIR/installed_at"
+}
+
+# ---- dnsmasq alias ---------------------------------------------------------
+configure_dns() {
+  step "Регистрация my.spacelink в dnsmasq"
+  router_ip=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
+
+  # OpenWrt-каноничный путь — через uci. dnsmasq.conf редактируется только как fallback.
+  if command -v uci >/dev/null 2>&1; then
+    # уберём старые записи, чтобы не плодить дубликаты при повторном запуске
+    while uci -q delete "dhcp.@dnsmasq[0].address[0]" >/dev/null 2>&1; do
+      # пройдемся по всем address, оставив только не-наши
+      list=$(uci -q get "dhcp.@dnsmasq[0].address" 2>/dev/null)
+      [ -z "$list" ] && break
+      case "$list" in *"my.spacelink"*) continue ;; *) break ;; esac
+    done
+    uci add_list "dhcp.@dnsmasq[0].address=/my.spacelink/$router_ip" >/dev/null 2>&1 || true
+    uci commit dhcp >/dev/null 2>&1 || true
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+    ok "my.spacelink → $router_ip (через uci)"
+  elif [ -f /etc/dnsmasq.conf ]; then
+    line="address=/my.spacelink/$router_ip"
+    grep -q '^address=/my.spacelink/' /etc/dnsmasq.conf || printf '%s\n' "$line" >> /etc/dnsmasq.conf
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+    ok "my.spacelink → $router_ip (через dnsmasq.conf)"
+  else
+    warn "ни uci, ни dnsmasq.conf не доступны — придётся открывать панель по IP: http://$router_ip"
+  fi
+}
+
+# ---- heartbeat cron --------------------------------------------------------
+install_cron() {
+  step "Установка cron для heartbeat"
+  cron_line="*/5 * * * * /usr/bin/wget -q -O- http://127.0.0.1:8080/api/local/status >/dev/null 2>&1"
+  if command -v crontab >/dev/null 2>&1; then
+    (crontab -l 2>/dev/null | grep -v 'space-link' ; printf '%s # space-link\n' "$cron_line") | crontab -
+    /etc/init.d/cron restart >/dev/null 2>&1 || true
+    ok "cron"
+  else
+    warn "crontab не найден — пропускаю"
+  fi
+}
+
+# ---- final summary ---------------------------------------------------------
+final_summary() {
+  router_ip=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
+  wifi=$(uci -q get wireless.@wifi-iface[0].ssid 2>/dev/null || echo "—")
+  printf '\n'
+  printf '%s\n' "================================================"
+  printf '   Space Link Router установлен (%s)\n' "$VERSION"
+  printf '%s\n' "================================================"
+  printf '   WiFi:       %s\n' "$wifi"
+  printf '   Панель:     http://my.spacelink   (или http://%s)\n' "$router_ip"
+  if [ -z "$TOKEN" ]; then
+    printf '   Токен:      не задан — введи в панели управления\n'
+  else
+    printf '   Токен:      сохранён\n'
+  fi
+  printf '%s\n' "================================================"
+}
+
+# ---- main ------------------------------------------------------------------
+banner
+printf '   Версия: %s   Режим: %s\n\n' "$VERSION" "$mode"
+
+preflight
+prompt_token
+install_packages
+install_binary
+install_ui
+install_rules
+install_templates
+save_state
+configure_dns
+enable_services
+install_cron
+final_summary
