@@ -14,6 +14,12 @@ WWW_DIR="$INSTALL_DIR/www"
 RULES_DIR="$INSTALL_DIR/rules"
 BIN_PATH="$INSTALL_DIR/space-link-api"
 
+# Где живёт наша панель. Берём отдельный alias-IP на LAN-интерфейсе чтобы
+# не конфликтовать с uhttpd (LuCI), который занят на основном адресе роутера.
+# IP подобран ВНЕ DHCP-пула OpenWrt (.100-.249) чтобы DHCP его не выдал клиенту.
+PANEL_IP="${PANEL_IP:-192.168.1.2}"
+PANEL_PORT="${PANEL_PORT:-80}"
+
 # Packages we hard-require: install must abort if any is missing.
 REQUIRED_PKGS="ca-certificates curl xray-core lighttpd lighttpd-mod-proxy lighttpd-mod-rewrite lighttpd-mod-redirect"
 # Optional pkgs — install if available, warn-only on failure.
@@ -284,13 +290,17 @@ install_rules() {
 install_templates() {
   step "Установка конфигов"
 
+  mkdir -p /etc/lighttpd/conf.d
   # lighttpd
   if [ -f "$SCRIPT_DIR/../templates/lighttpd.conf" ]; then
     cp "$SCRIPT_DIR/../templates/lighttpd.conf" /etc/lighttpd/conf.d/space-link.conf
   else
     fetch "$RELEASE_BASE/lighttpd.conf" /etc/lighttpd/conf.d/space-link.conf || warn "lighttpd.conf пропущен"
   fi
-  ok "lighttpd"
+  # подставляем PANEL_IP/PORT в шаблон
+  sed -i "s/__PANEL_IP__/$PANEL_IP/g; s/__PANEL_PORT__/$PANEL_PORT/g" \
+    /etc/lighttpd/conf.d/space-link.conf
+  ok "lighttpd ($PANEL_IP:$PANEL_PORT)"
 
   # init.d
   if [ -f "$SCRIPT_DIR/../templates/space-link.init" ]; then
@@ -300,6 +310,30 @@ install_templates() {
   fi
   chmod 0755 /etc/init.d/space-link
   ok "init.d"
+}
+
+# ---- panel IP alias --------------------------------------------------------
+configure_panel_ip() {
+  step "Alias-IP для панели: $PANEL_IP"
+  if ! command -v uci >/dev/null 2>&1; then
+    warn "uci недоступен — alias не настроен, панель будет на основном IP"
+    return 0
+  fi
+
+  # Создаём (или обновляем) секцию network.lan_panel
+  if ! uci -q get network.lan_panel >/dev/null 2>&1; then
+    uci set network.lan_panel='interface'
+  fi
+  uci set network.lan_panel.proto='static'
+  uci set network.lan_panel.device='br-lan'
+  uci set network.lan_panel.ipaddr="$PANEL_IP"
+  uci set network.lan_panel.netmask='255.255.255.0'
+  uci commit network
+
+  # Перечитываем сеть. На некоторых сборках reload может на пару секунд
+  # обронить SSH — это нормально, всё восстановится.
+  service network reload >/dev/null 2>&1 || /etc/init.d/network reload >/dev/null 2>&1 || true
+  ok "alias $PANEL_IP добавлен на br-lan"
 }
 
 # ---- enable services -------------------------------------------------------
@@ -353,29 +387,33 @@ save_state() {
 
 # ---- dnsmasq alias ---------------------------------------------------------
 configure_dns() {
-  step "Регистрация my.spacelink в dnsmasq"
-  router_ip=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
+  step "Регистрация my.spacelink → $PANEL_IP в dnsmasq"
 
-  # OpenWrt-каноничный путь — через uci. dnsmasq.conf редактируется только как fallback.
   if command -v uci >/dev/null 2>&1; then
-    # уберём старые записи, чтобы не плодить дубликаты при повторном запуске
-    while uci -q delete "dhcp.@dnsmasq[0].address[0]" >/dev/null 2>&1; do
-      # пройдемся по всем address, оставив только не-наши
-      list=$(uci -q get "dhcp.@dnsmasq[0].address" 2>/dev/null)
-      [ -z "$list" ] && break
-      case "$list" in *"my.spacelink"*) continue ;; *) break ;; esac
-    done
-    uci add_list "dhcp.@dnsmasq[0].address=/my.spacelink/$router_ip" >/dev/null 2>&1 || true
+    # Полностью переписываем address-list, выбрасывая ВСЕ старые my.spacelink
+    # записи (могли остаться с предыдущих версий установщика с другим IP),
+    # пользовательские оставляем нетронутыми.
+    addrs=$(uci -q get dhcp.@dnsmasq[0].address 2>/dev/null || true)
+    if [ -n "$addrs" ]; then
+      uci -q delete dhcp.@dnsmasq[0].address >/dev/null 2>&1 || true
+      for a in $addrs; do
+        case "$a" in
+          */my.spacelink/*) ;; # пропускаем
+          *) uci add_list dhcp.@dnsmasq[0].address="$a" >/dev/null 2>&1 ;;
+        esac
+      done
+    fi
+    uci add_list dhcp.@dnsmasq[0].address="/my.spacelink/$PANEL_IP" >/dev/null 2>&1
     uci commit dhcp >/dev/null 2>&1 || true
     /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
-    ok "my.spacelink → $router_ip (через uci)"
+    ok "my.spacelink → $PANEL_IP (через uci)"
   elif [ -f /etc/dnsmasq.conf ]; then
-    line="address=/my.spacelink/$router_ip"
-    grep -q '^address=/my.spacelink/' /etc/dnsmasq.conf || printf '%s\n' "$line" >> /etc/dnsmasq.conf
+    sed -i "/my\\.spacelink/d" /etc/dnsmasq.conf
+    printf 'address=/my.spacelink/%s\n' "$PANEL_IP" >> /etc/dnsmasq.conf
     /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
-    ok "my.spacelink → $router_ip (через dnsmasq.conf)"
+    ok "my.spacelink → $PANEL_IP (через dnsmasq.conf)"
   else
-    warn "ни uci, ни dnsmasq.conf не доступны — придётся открывать панель по IP: http://$router_ip"
+    warn "ни uci, ни dnsmasq.conf не доступны — открывай панель по IP: http://$PANEL_IP"
   fi
 }
 
@@ -401,7 +439,8 @@ final_summary() {
   printf '   Space Link Router установлен (%s)\n' "$VERSION"
   printf '%s\n' "================================================"
   printf '   WiFi:       %s\n' "$wifi"
-  printf '   Панель:     http://my.spacelink   (или http://%s)\n' "$router_ip"
+  printf '   Панель:     http://my.spacelink   (или http://%s)\n' "$PANEL_IP"
+  printf '   LuCI:       http://%s   (стандартный веб-интерфейс OpenWrt)\n' "$router_ip"
   if [ -z "$TOKEN" ]; then
     printf '   Токен:      не задан — введи в панели управления\n'
   else
@@ -421,6 +460,7 @@ install_binary
 install_ui
 install_rules
 install_templates
+configure_panel_ip
 save_state
 configure_dns
 enable_services
