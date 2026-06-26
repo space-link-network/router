@@ -11,7 +11,7 @@ Beryl AX (MT3000) идёт со стоковой прошивкой на баз�
 3. Включи SSH (System → Administration → SSH), задай root-пароль.
 4. По SSH:
    ```sh
-   wget -qO- https://raw.githubusercontent.com/space-link/space-link-router/main/install.sh | sh
+   wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
    ```
 5. Открой `http://my.spacelink` (или `http://192.168.8.1:81` если 80-й порт занят GL.iNet GUI).
 

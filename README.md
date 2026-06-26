@@ -10,10 +10,10 @@
 wget -qO- https://get.space-link.app/install.sh | sh
 ```
 
-Или напрямую из GitHub:
+Или напрямую из GitLab:
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/space-link/space-link-router/main/install.sh | sh
+wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 ```
 
 Установщик спросит токен. Если у тебя его пока нет — просто нажми Enter, настроишь позже через панель (`http://my.spacelink`).
@@ -44,7 +44,7 @@ wget -qO- https://raw.githubusercontent.com/space-link/space-link-router/main/in
 ## Удаление
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/space-link/space-link-router/main/uninstall.sh | sh
+wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/uninstall.sh | sh
 ```
 
 Чтобы стереть всё, включая токен: `... | sh -s -- --purge`.

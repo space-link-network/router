@@ -26,7 +26,7 @@ opkg install curl ca-bundle ca-certificates luci-i18n-base-ru
 ## Шаг 3. Установка Space Link
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/space-link/space-link-router/main/install.sh | sh
+wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 ```
 
 Введи токен (или Enter, чтобы пропустить). Дождись финальной плашки.

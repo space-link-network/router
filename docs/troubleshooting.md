@@ -49,14 +49,14 @@ ping -c 3 1.1.1.1
 ## Как полностью удалить
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/space-link/space-link-router/main/uninstall.sh | sh -s -- --purge
+wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/uninstall.sh | sh -s -- --purge
 ```
 Флаг `--purge` снесёт и токен.
 
 ## Куда писать, если ничего не помогает
 
 - Telegram: [@spacelink_support](https://t.me/spacelink_support)
-- Issue: [github.com/space-link/space-link-router/issues](https://github.com/space-link/space-link-router/issues)
+- Issue: [gitlab.com/space-link-vpn/router/-/issues](https://gitlab.com/space-link-vpn/router/-/issues)
 
 В обращении укажи модель роутера, версию OpenWrt (`cat /etc/openwrt_release`) и вывод:
 ```sh
