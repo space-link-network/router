@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.1.6"
+VERSION="0.1.7"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -186,7 +186,7 @@ ensure_dnsmasq_alive() {
     bad=$(grep -E "^[[:space:]]*list[[:space:]]+address.*\\\\" /etc/config/dhcp 2>/dev/null || true)
     if [ -n "$bad" ]; then
       warn "найдены битые записи, удаляю"
-      sed -i '/^[[:space:]]*list[[:space:]]\{1,\}address.*\\/d' /etc/config/dhcp 2>/dev/null || true
+      sed -i '/list address.*\\/d' /etc/config/dhcp 2>/dev/null || true
     fi
   fi
   /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
@@ -434,9 +434,11 @@ install_templates() {
   else
     fetch "$RELEASE_BASE/lighttpd.conf" /etc/lighttpd/conf.d/space-link.conf || warn "lighttpd.conf пропущен"
   fi
-  # Подставляем реальный bind/port (после configure_panel_ip).
-  sed -i "s/__PANEL_IP__/$EFFECTIVE_BIND/g; s/__PANEL_PORT__/$EFFECTIVE_PORT/g" \
-    /etc/lighttpd/conf.d/space-link.conf
+  # Подставляем реальный bind/port. Разделитель | вместо /, чтобы IP с маской
+  # или путь не ломали выражение. Отдельные -e команды — BusyBox sed не любит ';'.
+  sed -i -e "s|__PANEL_IP__|$EFFECTIVE_BIND|g" \
+         -e "s|__PANEL_PORT__|$EFFECTIVE_PORT|g" \
+    /etc/lighttpd/conf.d/space-link.conf 2>/dev/null || warn "не удалось подставить PANEL_IP/PORT в lighttpd.conf"
   ok "lighttpd ($EFFECTIVE_BIND:$EFFECTIVE_PORT)"
 
   # init.d
@@ -684,8 +686,9 @@ _dns_uci_purge_all() {
 _dns_sed_scrub() {
   [ -f /etc/config/dhcp ] || return 0
   cp /etc/config/dhcp "$BACKUP_DIR/dhcp.preinstall.$(date +%s 2>/dev/null || echo x)" 2>/dev/null || true
-  sed -i '/^[[:space:]]*list[[:space:]]\{1,\}address.*\\/d' /etc/config/dhcp 2>/dev/null || true
-  sed -i '/^[[:space:]]*list[[:space:]]\{1,\}address.*my\.spacelink/d' /etc/config/dhcp 2>/dev/null || true
+  # BusyBox sed: \{1,\} не поддерживается, используем простые паттерны.
+  sed -i '/list address.*\\/d' /etc/config/dhcp 2>/dev/null || true
+  sed -i '/list address.*my\.spacelink/d' /etc/config/dhcp 2>/dev/null || true
 }
 
 # Проверка: процесс жив И DNS реально отвечает.
