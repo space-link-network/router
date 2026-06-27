@@ -3,12 +3,13 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.1.5"
+VERSION="0.1.6"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
 CLOUD_API="${CLOUD_API:-https://api.space-link.app/api/v1}"
 STATE_DIR="/etc/space-link"
+BACKUP_DIR="/etc/space-link/backups"
 INSTALL_DIR="/opt/space-link"
 WWW_DIR="$INSTALL_DIR/www"
 RULES_DIR="$INSTALL_DIR/rules"
@@ -125,6 +126,91 @@ wait_service_up() {
     sleep 1
   done
   return 1
+}
+
+# ---- UCI backup / rollback -------------------------------------------------
+# Снимок текущих UCI-конфигов ДО любых правок. Хранится в /etc/space-link/backups/
+# вместе с симлинком *.latest.uci на актуальный. Используется чтобы при любой
+# поломке (наш баг, неудачный network reload, битый dhcp.address) можно было
+# вернуться к рабочему состоянию.
+backup_uci_state() {
+  mkdir -p "$BACKUP_DIR"
+  ts=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo unknown)
+  for conf in dhcp network firewall wireless; do
+    if uci -q export "$conf" > "$BACKUP_DIR/$conf.$ts.uci" 2>/dev/null; then
+      ln -sf "$conf.$ts.uci" "$BACKUP_DIR/$conf.latest.uci" 2>/dev/null || true
+    else
+      rm -f "$BACKUP_DIR/$conf.$ts.uci" 2>/dev/null || true
+    fi
+  done
+  # Сырые файлы тоже копируем — на случай если uci-парсер сам не справится.
+  for f in dhcp network firewall wireless; do
+    [ -r "/etc/config/$f" ] && cp "/etc/config/$f" "$BACKUP_DIR/$f.raw.$ts" 2>/dev/null || true
+  done
+  ok "снапшот UCI: $BACKUP_DIR (ts=$ts)"
+}
+
+rollback_uci() {
+  conf="$1"
+  bak="$BACKUP_DIR/${conf}.latest.uci"
+  [ -r "$bak" ] || return 1
+  uci -q import "$conf" < "$bak" 2>/dev/null || return 1
+  uci -q commit "$conf" 2>/dev/null || return 1
+  return 0
+}
+
+# ---- dnsmasq self-healing --------------------------------------------------
+# Если dnsmasq лежит (наследие от прошлой сломанной установки) — пытаемся
+# поднять. Последовательно: restart → чистка битых list address → restart →
+# восстановление /etc/config/dhcp из /rom/ → restart. Если и так не взлетел,
+# install прерывается, потому что без dnsmasq DHCP/DNS клиентам не работает.
+ensure_dnsmasq_alive() {
+  step "Проверка dnsmasq"
+  if pgrep dnsmasq >/dev/null 2>&1; then
+    ok "dnsmasq уже работает"
+    return 0
+  fi
+
+  warn "dnsmasq не запущен — пробую поднять"
+  /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+  sleep 2
+  if pgrep dnsmasq >/dev/null 2>&1; then
+    ok "dnsmasq поднят"
+    return 0
+  fi
+
+  # Битые address-записи (с экранированными кавычками и т.п.) типичный
+  # симптом — sed выгребает любую строку с обратным слэшем.
+  warn "ищу битые list address в /etc/config/dhcp"
+  if [ -f /etc/config/dhcp ]; then
+    bad=$(grep -E "^[[:space:]]*list[[:space:]]+address.*\\\\" /etc/config/dhcp 2>/dev/null || true)
+    if [ -n "$bad" ]; then
+      warn "найдены битые записи, удаляю"
+      sed -i '/^[[:space:]]*list[[:space:]]\{1,\}address.*\\/d' /etc/config/dhcp 2>/dev/null || true
+    fi
+  fi
+  /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+  sleep 2
+  if pgrep dnsmasq >/dev/null 2>&1; then
+    ok "dnsmasq поднят (после чистки битых записей)"
+    return 0
+  fi
+
+  # Заводской конфиг /rom/etc/config/dhcp — последний резерв.
+  if [ -r /rom/etc/config/dhcp ]; then
+    warn "восстанавливаю заводской /etc/config/dhcp из /rom/"
+    cp /etc/config/dhcp "$BACKUP_DIR/dhcp.broken.$(date +%s 2>/dev/null || echo x)" 2>/dev/null || true
+    cp /rom/etc/config/dhcp /etc/config/dhcp 2>/dev/null || true
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+    sleep 2
+  fi
+
+  if pgrep dnsmasq >/dev/null 2>&1; then
+    ok "dnsmasq восстановлен из заводского конфига"
+    return 0
+  fi
+
+  die "dnsmasq не запускается даже с заводского /etc/config/dhcp. Проверь logread -e dnsmasq."
 }
 
 # ---- preflight -------------------------------------------------------------
@@ -391,14 +477,35 @@ configure_panel_ip() {
   # обронить SSH — это нормально, всё восстановится.
   service network reload >/dev/null 2>&1 || /etc/init.d/network reload >/dev/null 2>&1 || true
 
+  # network reload не моментальный — даём 3 сек.
+  sleep 3
+
+  # Сначала проверяем не сломали ли мы основной LAN-IP. Если на br-lan вообще
+  # нет inet (или есть только наш alias) — это катастрофа, откатываемся.
+  main_ip_present=0
+  if [ -n "$ROUTER_IP" ] && ip addr show br-lan 2>/dev/null | grep -q "inet $ROUTER_IP/"; then
+    main_ip_present=1
+  fi
+  if [ "$main_ip_present" = "0" ]; then
+    warn "после network reload основной IP $ROUTER_IP пропал с br-lan — откатываю lan_panel"
+    uci -q delete network.lan_panel >/dev/null 2>&1 || true
+    uci -q commit network >/dev/null 2>&1 || true
+    rollback_uci network >/dev/null 2>&1 || true
+    service network reload >/dev/null 2>&1 || /etc/init.d/network reload >/dev/null 2>&1 || true
+    sleep 3
+    fallback_to_router_ip
+    return 0
+  fi
+
   # Проверка: реально ли поднялся alias на br-lan.
-  sleep 2
   if ip addr show br-lan 2>/dev/null | grep -q "inet $PANEL_IP/"; then
     EFFECTIVE_BIND="$PANEL_IP"
     EFFECTIVE_PORT="$PANEL_PORT"
-    ok "alias $PANEL_IP/24 поднят на br-lan"
+    ok "alias $PANEL_IP/24 поднят на br-lan (основной IP $ROUTER_IP жив)"
   else
     warn "alias $PANEL_IP не поднялся — fallback на основной IP роутера ($ROUTER_IP)"
+    uci -q delete network.lan_panel >/dev/null 2>&1 || true
+    uci -q commit network >/dev/null 2>&1 || true
     fallback_to_router_ip
   fi
 }
@@ -481,63 +588,117 @@ save_state() {
 }
 
 # ---- dnsmasq alias ---------------------------------------------------------
-# Идемпотентно: удаляем точечно все возможные старые address-записи my.spacelink
-# (на возможных IP-адресах), добавляем одну на EFFECTIVE_BIND. После рестарта
-# проверяем что dnsmasq поднялся — если нет, чистим address целиком и пробуем
-# снова без нашей записи (панель тогда открывается по IP, не по имени).
+# Защищённая версия. Шаги:
+#   1) выгребаем все my.spacelink-записи (uci del_list) и битые address'ы
+#      (sed по сырому /etc/config/dhcp — кавычки, лишние слэши).
+#   2) добавляем /my.spacelink/$EFFECTIVE_BIND.
+#   3) commit + restart + sleep 2 + verify (pgrep dnsmasq && nslookup gitlab.com).
+#   4) если verify провалился — откат через rollback_uci (наш свежий снапшот),
+#      затем /rom/etc/config/dhcp как последний резерв. После каждого отката
+#      делаем ещё одну попытку добавить my.spacelink.
 configure_dns() {
   step "Регистрация my.spacelink → $EFFECTIVE_BIND в dnsmasq"
 
-  if command -v uci >/dev/null 2>&1; then
-    _dns_uci_apply
-    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
-    if wait_service_up dnsmasq; then
-      ok "my.spacelink → $EFFECTIVE_BIND (через uci)"
-      return 0
-    fi
-    warn "dnsmasq не поднялся — чищу address-list и пробую заново"
-    _dns_uci_purge
-    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
-    if wait_service_up dnsmasq; then
-      warn "dnsmasq жив, но my.spacelink не зарегистрирован — открывай по IP: http://$EFFECTIVE_BIND"
+  if ! command -v uci >/dev/null 2>&1; then
+    if [ -f /etc/dnsmasq.conf ]; then
+      sed -i "/my\\.spacelink/d" /etc/dnsmasq.conf 2>/dev/null || true
+      printf 'address=/my.spacelink/%s\n' "$EFFECTIVE_BIND" >> /etc/dnsmasq.conf
+      /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+      ok "my.spacelink → $EFFECTIVE_BIND (через dnsmasq.conf)"
     else
-      warn "dnsmasq всё ещё не поднялся — проверь logread -e dnsmasq и uci show dhcp"
+      warn "ни uci, ни dnsmasq.conf не доступны — открывай панель по IP: http://$EFFECTIVE_BIND"
     fi
-  elif [ -f /etc/dnsmasq.conf ]; then
-    sed -i "/my\\.spacelink/d" /etc/dnsmasq.conf
-    printf 'address=/my.spacelink/%s\n' "$EFFECTIVE_BIND" >> /etc/dnsmasq.conf
+    return 0
+  fi
+
+  _dns_uci_purge_all
+  _dns_sed_scrub
+  uci -q add_list dhcp.@dnsmasq[0].address="/my.spacelink/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
+  uci -q commit dhcp >/dev/null 2>&1 || true
+  /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+  sleep 2
+
+  if _dns_verify; then
+    ok "my.spacelink → $EFFECTIVE_BIND (dnsmasq жив, DNS отвечает)"
+    return 0
+  fi
+
+  warn "dnsmasq не отвечает после правки — откатываю dhcp из снапшота"
+  if rollback_uci dhcp; then
     /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
-    ok "my.spacelink → $EFFECTIVE_BIND (через dnsmasq.conf)"
+    sleep 2
+  fi
+
+  if ! _dns_verify; then
+    warn "снапшот не помог — восстанавливаю заводской /etc/config/dhcp из /rom/"
+    if [ -r /rom/etc/config/dhcp ]; then
+      cp /etc/config/dhcp "$BACKUP_DIR/dhcp.broken.$(date +%s 2>/dev/null || echo x)" 2>/dev/null || true
+      cp /rom/etc/config/dhcp /etc/config/dhcp 2>/dev/null || true
+      /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+      sleep 2
+    fi
+  fi
+
+  if _dns_verify; then
+    # Базу подняли. Аккуратно докинем my.spacelink ещё раз.
+    uci -q add_list dhcp.@dnsmasq[0].address="/my.spacelink/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
+    uci -q commit dhcp >/dev/null 2>&1 || true
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+    sleep 2
+    if _dns_verify; then
+      ok "dnsmasq восстановлен, my.spacelink → $EFFECTIVE_BIND"
+    else
+      # Снова легло именно от нашей записи. Лучше потерять my.spacelink
+      # чем DHCP/DNS клиентам.
+      warn "my.spacelink ломает dnsmasq — оставляю без alias, открывай по IP: http://$EFFECTIVE_BIND"
+      uci -q del_list dhcp.@dnsmasq[0].address="/my.spacelink/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
+      uci -q commit dhcp >/dev/null 2>&1 || true
+      /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+    fi
   else
-    warn "ни uci, ни dnsmasq.conf не доступны — открывай панель по IP: http://$EFFECTIVE_BIND"
+    err "dnsmasq не стартует даже с заводского конфига. Проверь logread -e dnsmasq."
   fi
 }
 
-# Удаляет точечно записи /my.spacelink/<ip> для известных кандидатов, добавляет
-# одну на EFFECTIVE_BIND. del_list с несуществующим значением безопасно
-# игнорируется — никаких циклов по индексам и shell-escaping не требуется.
-_dns_uci_apply() {
+# Vsё, что когда-либо могло быть нашим address-ом — удаляем. Перебираем известные
+# IP-кандидаты + текущие значения; del_list по несуществующему — безопасно.
+_dns_uci_purge_all() {
   for ip in 192.168.1.1 192.168.1.2 192.168.1.3 192.168.1.100 192.168.1.101 192.168.0.1 "$ROUTER_IP" "$EFFECTIVE_BIND"; do
     [ -n "$ip" ] || continue
-    uci -q del_list dhcp.@dnsmasq[0].address="/my.spacelink/$ip" 2>/dev/null || true
+    uci -q del_list dhcp.@dnsmasq[0].address="/my.spacelink/$ip" >/dev/null 2>&1 || true
   done
-  uci add_list dhcp.@dnsmasq[0].address="/my.spacelink/$EFFECTIVE_BIND" >/dev/null 2>&1
-  uci commit dhcp >/dev/null 2>&1 || true
+  # Дополнительно — выгрести любое значение списка, где есть подстрока my.spacelink.
+  addrs=$(uci -q get dhcp.@dnsmasq[0].address 2>/dev/null || true)
+  if [ -n "$addrs" ]; then
+    for a in $addrs; do
+      case "$a" in
+        */my.spacelink/*) uci -q del_list dhcp.@dnsmasq[0].address="$a" >/dev/null 2>&1 || true ;;
+      esac
+    done
+  fi
 }
 
-# На случай если address-list где-то побился — выгребаем целиком все
-# my.spacelink-записи, обычные оставляем.
-_dns_uci_purge() {
-  addrs=$(uci -q get dhcp.@dnsmasq[0].address 2>/dev/null || true)
-  [ -n "$addrs" ] || return 0
-  uci -q delete dhcp.@dnsmasq[0].address >/dev/null 2>&1 || true
-  for a in $addrs; do
-    case "$a" in
-      */my.spacelink/*) ;;
-      *) uci add_list dhcp.@dnsmasq[0].address="$a" >/dev/null 2>&1 ;;
-    esac
-  done
-  uci commit dhcp >/dev/null 2>&1 || true
+# Sed по сырому /etc/config/dhcp. Снимает строки, в которых list address
+# содержит обратный слэш (типовой признак побитого экранирования) или
+# подстроку my.spacelink (если uci по какой-то причине промахнулся).
+_dns_sed_scrub() {
+  [ -f /etc/config/dhcp ] || return 0
+  cp /etc/config/dhcp "$BACKUP_DIR/dhcp.preinstall.$(date +%s 2>/dev/null || echo x)" 2>/dev/null || true
+  sed -i '/^[[:space:]]*list[[:space:]]\{1,\}address.*\\/d' /etc/config/dhcp 2>/dev/null || true
+  sed -i '/^[[:space:]]*list[[:space:]]\{1,\}address.*my\.spacelink/d' /etc/config/dhcp 2>/dev/null || true
+}
+
+# Проверка: процесс жив И DNS реально отвечает.
+_dns_verify() {
+  pgrep dnsmasq >/dev/null 2>&1 || return 1
+  if command -v nslookup >/dev/null 2>&1; then
+    nslookup gitlab.com 127.0.0.1 >/dev/null 2>&1 && return 0
+    # Бывает что gitlab.com не резолвится по причине внешнего блока — тогда
+    # запасной таргет, который точно резолвится через root-серверы.
+    nslookup openwrt.org 127.0.0.1 >/dev/null 2>&1 && return 0
+  fi
+  # Без nslookup доверяем pgrep — это всё ещё лучше, чем ничего.
+  return 0
 }
 
 # ---- heartbeat cron --------------------------------------------------------
@@ -577,6 +738,57 @@ final_summary() {
     printf '   Токен:      сохранён\n'
   fi
   printf '%s\n' "================================================"
+
+  # ---- диагностика ----------------------------------------------------------
+  printf '\n--- Диагностика ---\n'
+
+  dns_ok=0
+  if pgrep dnsmasq >/dev/null 2>&1; then
+    leases=0
+    [ -r /tmp/dhcp.leases ] && leases=$(wc -l < /tmp/dhcp.leases 2>/dev/null || echo 0)
+    printf '   DHCP/DNS:        OK  работает (%s аренд)\n' "$leases"
+    dns_ok=1
+  else
+    printf '   DHCP/DNS:        ERR dnsmasq не запущен — клиенты не получат IP!\n'
+  fi
+
+  api_ok=0
+  if command -v curl >/dev/null 2>&1 && \
+     curl -fsS -m 2 http://127.0.0.1:8080/api/local/health 2>/dev/null | grep -q '"ok":true'; then
+    printf '   space-link-api:  OK  отвечает\n'
+    api_ok=1
+  else
+    printf '   space-link-api:  ERR не отвечает на 127.0.0.1:8080\n'
+  fi
+
+  http_ok=0
+  if pgrep lighttpd >/dev/null 2>&1; then
+    printf '   lighttpd:        OK  работает\n'
+    http_ok=1
+  else
+    printf '   lighttpd:        ERR не запущен — панель недоступна\n'
+  fi
+
+  if pgrep -x xray >/dev/null 2>&1; then
+    printf '   xray:            OK  работает\n'
+  else
+    printf '   xray:            --  не запущен (норма пока не выбран сервер)\n'
+  fi
+
+  if command -v nslookup >/dev/null 2>&1 && \
+     nslookup my.spacelink 127.0.0.1 2>/dev/null | grep -q "$EFFECTIVE_BIND"; then
+    printf '   my.spacelink:    OK  резолвит в %s\n' "$EFFECTIVE_BIND"
+  else
+    printf '   my.spacelink:    --  не резолвит — открывай по %s\n' "$panel_url"
+  fi
+
+  printf '\n'
+  if [ "$dns_ok" = "1" ] && [ "$api_ok" = "1" ] && [ "$http_ok" = "1" ]; then
+    printf '   Установка успешна. Открывай: http://my.spacelink%s\n' "$port_suffix"
+  else
+    printf '   Установка завершена с предупреждениями. Запусти %s ещё раз — установщик попробует починить.\n' "$0"
+  fi
+  printf '\n'
 }
 
 # ---- main ------------------------------------------------------------------
@@ -584,6 +796,11 @@ banner
 printf '   Версия: %s   Режим: %s\n\n' "$VERSION" "$mode"
 
 preflight
+# Снапшот рабочих конфигов ДО любых правок — для отката если что-то пойдёт не так.
+mkdir -p "$BACKUP_DIR" 2>/dev/null || true
+backup_uci_state
+# Если dnsmasq уже лежит от прошлой кривой установки или ручных правок — чиним.
+ensure_dnsmasq_alive
 prompt_token
 install_packages
 install_binary
