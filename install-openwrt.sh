@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.1.10"
+VERSION="0.1.13"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -534,6 +534,108 @@ fallback_to_router_ip() {
   /etc/init.d/uhttpd disable >/dev/null 2>&1 || true
 }
 
+# ---- transparent proxy -----------------------------------------------------
+# Поднимаем TPROXY: маркируем LAN-трафик через nftables, заворачиваем по
+# fwmark в отдельную routing-таблицу с local-route на lo, где xray ловит его
+# на dokodemo-door :12345. Без этого xray на роутере — просто SOCKS-прокси
+# на localhost, и клиенты в WiFi его не видят.
+#
+# Параметры можно переопределить из окружения (TPROXY_PORT/TPROXY_MARK/TPROXY_TABLE),
+# но дефолты прибиты к xray-config.json — менять синхронно с api/internal/xray/xray.go.
+configure_tproxy() {
+  step "Настройка прозрачного проксирования (TPROXY)"
+  TPROXY_PORT="${TPROXY_PORT:-12345}"
+  TPROXY_MARK="${TPROXY_MARK:-255}"
+  TPROXY_TABLE="${TPROXY_TABLE:-100}"
+
+  # 1) Имя для своей routing-таблицы. Просто метка для удобства чтения
+  #    `ip rule show` / `ip route show table space-link`.
+  mkdir -p /etc/iproute2 2>/dev/null || true
+  if [ -f /etc/iproute2/rt_tables ]; then
+    if ! grep -q "^[[:space:]]*$TPROXY_TABLE[[:space:]]\+space-link" /etc/iproute2/rt_tables 2>/dev/null; then
+      # Удалим возможный старый алиас на эту цифру и допишем свой.
+      sed -i "/^[[:space:]]*$TPROXY_TABLE[[:space:]]/d" /etc/iproute2/rt_tables 2>/dev/null || true
+      printf '%s space-link\n' "$TPROXY_TABLE" >> /etc/iproute2/rt_tables
+    fi
+  fi
+
+  # 2) Hotplug-скрипт: переподнимет ip rule + route после перезагрузки или
+  #    при подъёме любого интерфейса (network reload и т.п.).
+  mkdir -p /etc/hotplug.d/iface 2>/dev/null || true
+  cat > /etc/hotplug.d/iface/99-space-link-tproxy <<HOOK
+#!/bin/sh
+[ "\$ACTION" = "ifup" ] || exit 0
+ip rule add fwmark $TPROXY_MARK table $TPROXY_TABLE 2>/dev/null
+ip -6 rule add fwmark $TPROXY_MARK table $TPROXY_TABLE 2>/dev/null
+ip route add local 0.0.0.0/0 dev lo table $TPROXY_TABLE 2>/dev/null
+HOOK
+  chmod 0755 /etc/hotplug.d/iface/99-space-link-tproxy 2>/dev/null || true
+
+  # 3) Применить прямо сейчас (идемпотентно).
+  ip rule del fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" 2>/dev/null || true
+  ip rule add fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" 2>/dev/null || true
+  ip route flush table "$TPROXY_TABLE" 2>/dev/null || true
+  ip route add local 0.0.0.0/0 dev lo table "$TPROXY_TABLE" 2>/dev/null || true
+
+  # 4) nftables-конфиг. OpenWrt 25.x использует fw4, который сам подсасывает
+  #    drop-in файлы из /etc/nftables.d/.
+  mkdir -p /etc/nftables.d 2>/dev/null || true
+  cat > /etc/nftables.d/99-space-link-tproxy.nft <<NFT
+table inet space_link {
+    chain prerouting {
+        type filter hook prerouting priority mangle; policy accept;
+
+        ip daddr 0.0.0.0/8        return
+        ip daddr 10.0.0.0/8       return
+        ip daddr 127.0.0.0/8      return
+        ip daddr 169.254.0.0/16   return
+        ip daddr 172.16.0.0/12    return
+        ip daddr 192.168.0.0/16   return
+        ip daddr 224.0.0.0/4      return
+        ip daddr 240.0.0.0/4      return
+        ip daddr 255.255.255.255  return
+        fib daddr type local      return
+
+        iifname "br-lan" meta l4proto { tcp, udp } tproxy ip to :$TPROXY_PORT meta mark set $TPROXY_MARK accept
+    }
+
+    chain output {
+        type route hook output priority mangle; policy accept;
+
+        meta mark $TPROXY_MARK return
+        skuid 0 ip daddr 0.0.0.0/8        return
+        skuid 0 ip daddr 10.0.0.0/8       return
+        skuid 0 ip daddr 127.0.0.0/8      return
+        skuid 0 ip daddr 169.254.0.0/16   return
+        skuid 0 ip daddr 172.16.0.0/12    return
+        skuid 0 ip daddr 192.168.0.0/16   return
+        skuid 0 ip daddr 224.0.0.0/4      return
+        skuid 0 ip daddr 240.0.0.0/4      return
+        skuid 0 fib daddr type local      return
+    }
+}
+NFT
+
+  # Валидация — если синтаксис битый, не ломаем общий fw4, просто warn.
+  if command -v nft >/dev/null 2>&1; then
+    if ! nft -c -f /etc/nftables.d/99-space-link-tproxy.nft >/dev/null 2>&1; then
+      warn "nft не принял конфиг TPROXY — оставляю файл для отладки, fw4 не reloading"
+      ok "TPROXY: hotplug+ip rule установлены (port=$TPROXY_PORT, mark=$TPROXY_MARK), nft пропущен"
+      return 0
+    fi
+  fi
+
+  # Применить через fw4 (предпочтительно — переживёт system restart/firewall reload).
+  if command -v fw4 >/dev/null 2>&1; then
+    fw4 reload >/dev/null 2>&1 || warn "fw4 reload вернул ошибку — проверь logread -e fw4"
+  elif command -v nft >/dev/null 2>&1; then
+    # Голый nftables — выкатим напрямую (переживёт reboot только если /etc/init.d/firewall пуст).
+    nft -f /etc/nftables.d/99-space-link-tproxy.nft 2>/dev/null || warn "nft не применился"
+  fi
+
+  ok "TPROXY настроен (port=$TPROXY_PORT, mark=$TPROXY_MARK, table=$TPROXY_TABLE)"
+}
+
 # ---- enable services -------------------------------------------------------
 enable_services() {
   step "Включение сервисов"
@@ -806,6 +908,12 @@ final_summary() {
     printf '   my.spacelink:    --  не резолвит — открывай по %s\n' "$panel_url"
   fi
 
+  if command -v nft >/dev/null 2>&1 && nft list table inet space_link >/dev/null 2>&1; then
+    printf '   TPROXY:          OK  nft table space_link загружена\n'
+  else
+    printf '   TPROXY:          ERR таблица не загружена — проверь fw4 reload / logread -e firewall\n'
+  fi
+
   printf '\n'
   if [ "$dns_ok" = "1" ] && [ "$api_ok" = "1" ] && [ "$http_ok" = "1" ]; then
     printf '   Установка успешна. Открывай: http://my.spacelink%s\n' "$port_suffix"
@@ -834,6 +942,7 @@ configure_panel_ip
 install_templates
 save_state
 configure_dns
+configure_tproxy
 enable_services
 install_cron
 final_summary
