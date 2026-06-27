@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.2.4"
+VERSION="0.2.5"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -521,13 +521,21 @@ configure_panel_ip() {
     EFFECTIVE_BIND="$PANEL_IP"
     EFFECTIVE_PORT="$PANEL_PORT"
     ok "доп. IP $PANEL_IP/24 на br-lan, основной $ROUTER_IP жив — LuCI и панель параллельно"
-    # Прошлые версии (v0.1.7 fallback) могли disable+stop uhttpd. Сейчас :80
-    # на основном IP свободен — поднимаем LuCI обратно.
-    /etc/init.d/uhttpd enable >/dev/null 2>&1 || true
-    /etc/init.d/uhttpd start  >/dev/null 2>&1 || true
+    # Прибиваем uhttpd явно к ROUTER_IP, без 0.0.0.0-wildcard. Без этого
+    # uhttpd при следующем boot стартует первым и забирает 0.0.0.0:80 на
+    # всех интерфейсах включая PANEL_IP — наш lighttpd падает на
+    # "Address already in use" и панель пропадает после reboot.
+    uci -q delete uhttpd.main.listen_http  >/dev/null 2>&1 || true
+    uci -q delete uhttpd.main.listen_https >/dev/null 2>&1 || true
+    uci add_list uhttpd.main.listen_http="$ROUTER_IP:80"   >/dev/null 2>&1 || true
+    uci add_list uhttpd.main.listen_https="$ROUTER_IP:443" >/dev/null 2>&1 || true
+    uci commit uhttpd >/dev/null 2>&1 || true
+
+    /etc/init.d/uhttpd enable  >/dev/null 2>&1 || true
+    /etc/init.d/uhttpd restart >/dev/null 2>&1 || /etc/init.d/uhttpd start >/dev/null 2>&1 || true
     sleep 1
     if pgrep uhttpd >/dev/null 2>&1; then
-      ok "uhttpd (LuCI) запущен на http://$ROUTER_IP/"
+      ok "uhttpd (LuCI) запущен на http://$ROUTER_IP/ (bind only)"
     else
       warn "uhttpd не стартовал — LuCI недоступна, не критично"
     fi
