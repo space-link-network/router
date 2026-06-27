@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.2.2"
+VERSION="0.2.3"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -643,21 +643,9 @@ table inet space_link {
 
         iifname "br-lan" meta l4proto { tcp, udp } tproxy ip to :__TPROXY_PORT__ meta mark set __TPROXY_MARK__ accept
     }
-
-    chain output {
-        type route hook output priority mangle; policy accept;
-
-        meta mark __TPROXY_MARK__ return
-        ip daddr 0.0.0.0/8        return
-        ip daddr 10.0.0.0/8       return
-        ip daddr 127.0.0.0/8      return
-        ip daddr 169.254.0.0/16   return
-        ip daddr 172.16.0.0/12    return
-        ip daddr 192.168.0.0/16   return
-        ip daddr 224.0.0.0/4      return
-        ip daddr 240.0.0.0/4      return
-        fib daddr type local      return
-    }
+    # output chain убран в v0.2.3 — он содержал только returns без активной
+    # маркировки, при этом регистрировался как второй mangle-hook на output
+    # и конфликтовал с fw4-chain, провоцируя respawn-петлю sing-box.
 }
 NFT
   sed -i "s/__TPROXY_PORT__/$TPROXY_PORT/g; s/__TPROXY_MARK__/$TPROXY_MARK/g" /etc/space-link/tproxy.nft
@@ -730,16 +718,44 @@ enable_services() {
         printf '%s\n' '{"log":{"level":"warn"},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}]}' > /etc/sing-box/config.json
     fi
   fi
-  # CAP_NET_ADMIN нужен для tproxy-инбаунда :12345 — без него init.d падает с
-  # "listen tcp4 0.0.0.0:12345: operation not permitted". libcap-bin ставим
-  # тут же, если ещё нет setcap.
+  # ---- sing-box capabilities ----------------------------------------------
+  # CAP_NET_ADMIN нужен для tproxy-инбаунда :12345 — без него init.d падает
+  # с "listen tcp4 0.0.0.0:12345: operation not permitted". В v0.2.2 мы
+  # делали setcap на бинарь, но procd при respawn ре-exec'ает через
+  # posix_spawn() — file caps не наследуются → процесс падает каждые 2-5 сек
+  # в цикле. Правильный путь — отдать caps через сам procd через
+  # `procd_set_param capabilities /etc/capabilities/sing-box.json`. Тогда
+  # ambient/inheritable caps сохраняются на respawn.
+  mkdir -p /etc/capabilities
+  cat > /etc/capabilities/sing-box.json <<'CAP'
+{
+  "ambient":     ["NET_ADMIN", "NET_RAW", "NET_BIND_SERVICE"],
+  "bounding":    ["NET_ADMIN", "NET_RAW", "NET_BIND_SERVICE"],
+  "effective":   ["NET_ADMIN", "NET_RAW", "NET_BIND_SERVICE"],
+  "permitted":   ["NET_ADMIN", "NET_RAW", "NET_BIND_SERVICE"],
+  "inheritable": ["NET_ADMIN", "NET_RAW", "NET_BIND_SERVICE"]
+}
+CAP
+  ok "/etc/capabilities/sing-box.json"
+
+  # Патчим /etc/init.d/sing-box: добавляем строку `procd_set_param capabilities ...`
+  # перед `procd_close_instance`. Idempotent: если уже есть — пропускаем.
+  if [ -f /etc/init.d/sing-box ] && ! grep -q "capabilities /etc/capabilities/sing-box.json" /etc/init.d/sing-box; then
+    # backup перед патчем (только один раз)
+    [ -f /etc/init.d/sing-box.orig ] || cp /etc/init.d/sing-box /etc/init.d/sing-box.orig
+    awk '/procd_close_instance/ && !done { print "\tprocd_set_param capabilities /etc/capabilities/sing-box.json"; done=1 } { print }' \
+      /etc/init.d/sing-box.orig > /etc/init.d/sing-box
+    chmod 0755 /etc/init.d/sing-box
+    ok "init.d/sing-box патчен на procd capabilities"
+  fi
+
+  # Fallback: всё-таки делаем setcap на бинарь — на случай если procd
+  # capabilities у юзера какая-то странная версия.
   if ! command -v setcap >/dev/null 2>&1; then
     apk add libcap-bin >/dev/null 2>&1 || opkg install libcap-bin >/dev/null 2>&1 || true
   fi
   if command -v setcap >/dev/null 2>&1 && [ -x /usr/bin/sing-box ]; then
-    setcap "cap_net_admin,cap_net_bind_service,cap_net_raw+ep" /usr/bin/sing-box >/dev/null 2>&1 \
-      && ok "setcap CAP_NET_ADMIN на /usr/bin/sing-box" \
-      || warn "setcap не сработал — init.d sing-box может падать"
+    setcap "cap_net_admin,cap_net_bind_service,cap_net_raw+ep" /usr/bin/sing-box >/dev/null 2>&1 || true
   fi
 
   # uci sing-box.main.enabled=1 — без этого init.d молча выходит из start_service.
