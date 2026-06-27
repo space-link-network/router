@@ -8,10 +8,19 @@ INSTALL_DIR="/opt/space-link"
 printf '==> Останавливаю сервисы\n'
 /etc/init.d/space-link stop 2>/dev/null || true
 /etc/init.d/space-link disable 2>/dev/null || true
+# VPN-движок (с v0.2.0 — sing-box). Сам пакет оставляем установленным, чтобы
+# повторная установка прошла без сети, но конфиг и автозапуск выключаем.
+/etc/init.d/sing-box stop    2>/dev/null || true
+/etc/init.d/sing-box disable 2>/dev/null || true
 
 printf '==> Удаляю файлы\n'
 rm -f /etc/init.d/space-link
 rm -f /etc/lighttpd/conf.d/space-link.conf
+rm -rf /etc/sing-box 2>/dev/null || true
+# Артефакты старого xray-движка (v0.1.x) — если роутер апгрейдится с предыдущей
+# версии, тоже подметаем. На свежей v0.2.0 уже отсутствуют — rm молча проходит.
+rm -rf /etc/xray 2>/dev/null || true
+rm -f /usr/bin/geoip.dat /usr/bin/geosite.dat 2>/dev/null || true
 rm -rf "$INSTALL_DIR"
 
 # Сохраняем токен по умолчанию — позволяет переустановку без повторного ввода.

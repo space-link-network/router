@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.1.16"
+VERSION="0.2.0"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -28,7 +28,7 @@ EFFECTIVE_PORT="$PANEL_PORT"
 ROUTER_IP=""
 
 # Packages we hard-require: install must abort if any is missing.
-REQUIRED_PKGS="ca-certificates curl xray-core lighttpd lighttpd-mod-proxy lighttpd-mod-rewrite lighttpd-mod-redirect"
+REQUIRED_PKGS="ca-certificates curl sing-box lighttpd lighttpd-mod-proxy lighttpd-mod-rewrite lighttpd-mod-redirect"
 # Optional pkgs — install if available, warn-only on failure.
 OPTIONAL_PKGS="kmod-tun"
 
@@ -211,6 +211,25 @@ ensure_dnsmasq_alive() {
   fi
 
   die "dnsmasq не запускается даже с заводского /etc/config/dhcp. Проверь logread -e dnsmasq."
+}
+
+# ---- migrate from xray (v0.1.x → v0.2.0) ----------------------------------
+# Раньше движком был xray-core. С v0.2.0 переехали на sing-box. Если на роутере
+# остались старые артефакты — гасим демона и сносим конфиги/geo-данные, чтобы
+# не сбивали init.d и не занимали место. Идемпотентно: если xray не было,
+# функция молча проходит.
+migrate_from_xray() {
+  if [ ! -f /etc/init.d/xray ] && [ ! -d /etc/xray ]; then
+    return 0
+  fi
+  step "Миграция с xray (если был)"
+  if [ -f /etc/init.d/xray ]; then
+    /etc/init.d/xray stop    >/dev/null 2>&1 || true
+    /etc/init.d/xray disable >/dev/null 2>&1 || true
+  fi
+  rm -rf /etc/xray 2>/dev/null || true
+  rm -f /usr/bin/geoip.dat /usr/bin/geosite.dat 2>/dev/null || true
+  ok "xray-артефакты убраны"
 }
 
 # ---- preflight -------------------------------------------------------------
@@ -536,12 +555,12 @@ fallback_to_router_ip() {
 
 # ---- transparent proxy -----------------------------------------------------
 # Поднимаем TPROXY: маркируем LAN-трафик через nftables, заворачиваем по
-# fwmark в отдельную routing-таблицу с local-route на lo, где xray ловит его
-# на dokodemo-door :12345. Без этого xray на роутере — просто SOCKS-прокси
+# fwmark в отдельную routing-таблицу с local-route на lo, где sing-box ловит его
+# на tproxy inbound :12345. Без этого sing-box на роутере — просто SOCKS-прокси
 # на localhost, и клиенты в WiFi его не видят.
 #
 # Параметры можно переопределить из окружения (TPROXY_PORT/TPROXY_MARK/TPROXY_TABLE),
-# но дефолты прибиты к xray-config.json — менять синхронно с api/internal/xray/xray.go.
+# но дефолты прибиты к sing-box-конфигу — менять синхронно с api/internal/singbox/singbox.go.
 #
 # На OpenWrt 25.x все файлы в /etc/nftables.d/ инклюдятся ВНУТРЬ fw4-сгенерированной
 # таблицы — там нельзя писать `table inet space_link { ... }` (таблица в таблице,
@@ -699,15 +718,21 @@ HOOK
 enable_services() {
   step "Включение сервисов"
 
-  # xray — ставим минимальный заглушечный конфиг, чтобы init.d не падал
-  # до того, как Go API отрендерит реальный config.json с активным сервером.
-  if [ ! -s /etc/xray/config.json ]; then
-    mkdir -p /etc/xray
-    printf '%s\n' '{"inbounds":[],"outbounds":[{"protocol":"freedom","tag":"direct"}]}' > /etc/xray/config.json
+  # sing-box — ставим минимальный заглушечный конфиг (direct outbound, без
+  # inbounds), чтобы init.d не падал до того, как Go API отрендерит реальный
+  # config.json с активным сервером. С v0.2.0 движок sing-box заменил xray-core.
+  if [ ! -s /etc/sing-box/config.json ]; then
+    mkdir -p /etc/sing-box
+    if [ -f "$SCRIPT_DIR/../templates/sing-box-stub.json" ]; then
+      cp "$SCRIPT_DIR/../templates/sing-box-stub.json" /etc/sing-box/config.json
+    else
+      fetch "$RELEASE_BASE/sing-box-stub.json" /etc/sing-box/config.json 2>/dev/null || \
+        printf '%s\n' '{"log":{"level":"warn"},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}]}' > /etc/sing-box/config.json
+    fi
   fi
-  /etc/init.d/xray enable >/dev/null 2>&1 || true
-  /etc/init.d/xray restart >/dev/null 2>&1 || /etc/init.d/xray start >/dev/null 2>&1 \
-    || warn "xray не стартовал — посмотри logread -e xray"
+  /etc/init.d/sing-box enable >/dev/null 2>&1 || true
+  /etc/init.d/sing-box restart >/dev/null 2>&1 || /etc/init.d/sing-box start >/dev/null 2>&1 \
+    || warn "sing-box не стартовал — посмотри logread -e sing-box"
 
   /etc/init.d/space-link enable >/dev/null 2>&1 || true
   /etc/init.d/space-link restart >/dev/null 2>&1 || /etc/init.d/space-link start >/dev/null 2>&1 \
@@ -946,10 +971,10 @@ final_summary() {
     printf '   lighttpd:        ERR не запущен — панель недоступна\n'
   fi
 
-  if pgrep -x xray >/dev/null 2>&1; then
-    printf '   xray:            OK  работает\n'
+  if pgrep -x sing-box >/dev/null 2>&1; then
+    printf '   sing-box:        OK  работает\n'
   else
-    printf '   xray:            --  не запущен (норма пока не выбран сервер)\n'
+    printf '   sing-box:        --  не запущен (норма пока не выбран сервер)\n'
   fi
 
   if [ "$EFFECTIVE_BIND" = "$router_ip" ]; then
@@ -994,6 +1019,7 @@ backup_uci_state
 ensure_dnsmasq_alive
 prompt_token
 install_packages
+migrate_from_xray
 install_binary
 install_ui
 install_rules
