@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.1.7"
+VERSION="0.1.8"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -457,59 +457,63 @@ install_templates() {
 # EFFECTIVE_PORT в конце отражают реальное место панели.
 configure_panel_ip() {
   ROUTER_IP=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
+  ROUTER_MASK=$(uci -q get network.lan.netmask 2>/dev/null || echo "255.255.255.0")
 
-  step "Alias-IP для панели: $PANEL_IP"
+  step "Доп. IP для панели: $PANEL_IP"
   if ! command -v uci >/dev/null 2>&1; then
     warn "uci недоступен — переключаюсь на основной IP роутера ($ROUTER_IP)"
     fallback_to_router_ip
     return 0
   fi
 
-  # Создаём (или обновляем) секцию network.lan_panel
-  if ! uci -q get network.lan_panel >/dev/null 2>&1; then
-    uci set network.lan_panel='interface'
+  # Удалим старый отдельный интерфейс lan_panel если был от v0.1.4-v0.1.7 —
+  # он на OpenWrt 25.x ломал основной IP. Переходим на secondary list ipaddr.
+  if uci -q get network.lan_panel >/dev/null 2>&1; then
+    uci -q delete network.lan_panel
   fi
-  uci set network.lan_panel.proto='static'
-  uci set network.lan_panel.device='br-lan'
-  uci set network.lan_panel.ipaddr="$PANEL_IP"
-  uci set network.lan_panel.netmask='255.255.255.0'
+
+  # Добавляем PANEL_IP как secondary в существующий lan через list ipaddr.
+  # Если в lan уже singular `option ipaddr` — он автоматически становится
+  # первым элементом list при add_list. Маска уходит в /24 (либо
+  # перерасчёт из текущей netmask, для простоты считаем стандарт /24).
+  cidr_main="$ROUTER_IP/24"
+  cidr_panel="$PANEL_IP/24"
+
+  # Соберём актуальный list ipaddr (может уже быть многосписочным).
+  current_addrs=$(uci -q get network.lan.ipaddr 2>/dev/null || true)
+  # Если current это одиночный без /, добавим /24.
+  case "$current_addrs" in
+    */24|*/16|*/8) cidr_main="$current_addrs" ;;
+  esac
+
+  # Перезаписываем целиком, чтобы убрать возможные дубли наших прошлых попыток.
+  uci -q delete network.lan.ipaddr 2>/dev/null || true
+  uci add_list network.lan.ipaddr="$cidr_main"
+  uci add_list network.lan.ipaddr="$cidr_panel"
   uci commit network
 
-  # Перечитываем сеть. На некоторых сборках reload может на пару секунд
-  # обронить SSH — это нормально, всё восстановится.
+  # Reload сети — нативный путь, в одном интерфейсе оба IP не теряются.
   service network reload >/dev/null 2>&1 || /etc/init.d/network reload >/dev/null 2>&1 || true
-
-  # network reload не моментальный — даём 3 сек.
   sleep 3
 
-  # Сначала проверяем не сломали ли мы основной LAN-IP. Если на br-lan вообще
-  # нет inet (или есть только наш alias) — это катастрофа, откатываемся.
-  main_ip_present=0
-  if [ -n "$ROUTER_IP" ] && ip addr show br-lan 2>/dev/null | grep -q "inet $ROUTER_IP/"; then
-    main_ip_present=1
-  fi
-  if [ "$main_ip_present" = "0" ]; then
-    warn "после network reload основной IP $ROUTER_IP пропал с br-lan — откатываю lan_panel"
-    uci -q delete network.lan_panel >/dev/null 2>&1 || true
-    uci -q commit network >/dev/null 2>&1 || true
-    rollback_uci network >/dev/null 2>&1 || true
-    service network reload >/dev/null 2>&1 || /etc/init.d/network reload >/dev/null 2>&1 || true
-    sleep 3
-    fallback_to_router_ip
+  # Verify: основной IP жив И PANEL_IP появился.
+  main_present=0
+  alias_present=0
+  ip addr show br-lan 2>/dev/null | grep -q "inet $ROUTER_IP/" && main_present=1
+  ip addr show br-lan 2>/dev/null | grep -q "inet $PANEL_IP/" && alias_present=1
+
+  if [ "$main_present" = "1" ] && [ "$alias_present" = "1" ]; then
+    EFFECTIVE_BIND="$PANEL_IP"
+    EFFECTIVE_PORT="$PANEL_PORT"
+    ok "доп. IP $PANEL_IP/24 на br-lan, основной $ROUTER_IP жив — LuCI и панель параллельно"
     return 0
   fi
 
-  # Проверка: реально ли поднялся alias на br-lan.
-  if ip addr show br-lan 2>/dev/null | grep -q "inet $PANEL_IP/"; then
-    EFFECTIVE_BIND="$PANEL_IP"
-    EFFECTIVE_PORT="$PANEL_PORT"
-    ok "alias $PANEL_IP/24 поднят на br-lan (основной IP $ROUTER_IP жив)"
-  else
-    warn "alias $PANEL_IP не поднялся — fallback на основной IP роутера ($ROUTER_IP)"
-    uci -q delete network.lan_panel >/dev/null 2>&1 || true
-    uci -q commit network >/dev/null 2>&1 || true
-    fallback_to_router_ip
-  fi
+  warn "secondary IP не встал (main=$main_present alias=$alias_present) — откатываю"
+  rollback_uci network >/dev/null 2>&1 || true
+  service network reload >/dev/null 2>&1 || /etc/init.d/network reload >/dev/null 2>&1 || true
+  sleep 3
+  fallback_to_router_ip
 }
 
 # Вариант A: гасим uhttpd (LuCI), слушаем на основном IP роутера :80.
