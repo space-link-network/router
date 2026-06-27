@@ -23,15 +23,25 @@ fi
 printf '==> Снимаю прозрачное проксирование (TPROXY)\n'
 TPROXY_MARK="${TPROXY_MARK:-255}"
 TPROXY_TABLE="${TPROXY_TABLE:-100}"
+# v0.1.14+: standalone init.d + own nft файл вне /etc/nftables.d/.
+if [ -x /etc/init.d/space-link-tproxy ]; then
+  /etc/init.d/space-link-tproxy stop 2>/dev/null || true
+  /etc/init.d/space-link-tproxy disable 2>/dev/null || true
+fi
+rm -f /etc/init.d/space-link-tproxy 2>/dev/null || true
+rm -f /etc/space-link/tproxy.nft 2>/dev/null || true
+rm -f /etc/hotplug.d/firewall/99-space-link-tproxy 2>/dev/null || true
+# v0.1.13 артефакты — у некоторых пользователей ещё могут остаться.
 rm -f /etc/hotplug.d/iface/99-space-link-tproxy 2>/dev/null || true
 rm -f /etc/nftables.d/99-space-link-tproxy.nft 2>/dev/null || true
 ip rule del fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" 2>/dev/null || true
 ip -6 rule del fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" 2>/dev/null || true
 ip route flush table "$TPROXY_TABLE" 2>/dev/null || true
+if command -v nft >/dev/null 2>&1; then
+  nft delete table inet space_link >/dev/null 2>&1 || true
+fi
 if command -v fw4 >/dev/null 2>&1; then
   fw4 reload >/dev/null 2>&1 || true
-elif command -v nft >/dev/null 2>&1; then
-  nft delete table inet space_link >/dev/null 2>&1 || true
 fi
 if [ -f /etc/iproute2/rt_tables ]; then
   sed -i "/^[[:space:]]*$TPROXY_TABLE[[:space:]]\+space-link/d" /etc/iproute2/rt_tables 2>/dev/null || true

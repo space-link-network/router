@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.1.13"
+VERSION="0.1.15"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -542,45 +542,71 @@ fallback_to_router_ip() {
 #
 # Параметры можно переопределить из окружения (TPROXY_PORT/TPROXY_MARK/TPROXY_TABLE),
 # но дефолты прибиты к xray-config.json — менять синхронно с api/internal/xray/xray.go.
+#
+# На OpenWrt 25.x все файлы в /etc/nftables.d/ инклюдятся ВНУТРЬ fw4-сгенерированной
+# таблицы — там нельзя писать `table inet space_link { ... }` (таблица в таблице,
+# парсер падает). Поэтому держим nft-конфиг отдельно: свой каталог
+# /etc/space-link/, свой init.d-скрипт, и hotplug firewall — поднимает табличку
+# обратно после каждого fw4 reload, который мог снести её.
 configure_tproxy() {
   step "Настройка прозрачного проксирования (TPROXY)"
   TPROXY_PORT="${TPROXY_PORT:-12345}"
   TPROXY_MARK="${TPROXY_MARK:-255}"
   TPROXY_TABLE="${TPROXY_TABLE:-100}"
 
-  # 1) Имя для своей routing-таблицы. Просто метка для удобства чтения
-  #    `ip rule show` / `ip route show table space-link`.
+  # 1) Убедимся что ядро умеет nft tproxy. Сначала пробуем modprobe, потом
+  #    apk add нужных kmod-пакетов. Если ничего не помогло — выходим
+  #    мягко, не валим всю установку.
+  for mod in nf_tproxy xt_TPROXY nft_tproxy; do
+    lsmod 2>/dev/null | grep -q "^$mod " || modprobe "$mod" 2>/dev/null || true
+  done
+  if ! lsmod 2>/dev/null | grep -q nft_tproxy; then
+    warn "nft_tproxy не загружен, ставлю пакет"
+    if [ "$PKG_MGR" = "apk" ]; then
+      apk add kmod-nft-tproxy kmod-nf-tproxy >/dev/null 2>&1 || {
+        warn "kmod-nft-tproxy не доступен — TPROXY не настроится"
+        return 0
+      }
+    elif [ "$PKG_MGR" = "opkg" ]; then
+      opkg install kmod-nft-tproxy kmod-nf-tproxy >/dev/null 2>&1 || {
+        warn "kmod-nft-tproxy не доступен — TPROXY не настроится"
+        return 0
+      }
+    fi
+    modprobe nft_tproxy 2>/dev/null || true
+    if ! lsmod 2>/dev/null | grep -q nft_tproxy; then
+      warn "модуль nft_tproxy не загрузился — TPROXY не настроится"
+      return 0
+    fi
+  fi
+  ok "nft_tproxy готов"
+
+  # 2) Снять старый сломанный drop-in из v0.1.13 если он остался.
+  if [ -f /etc/nftables.d/99-space-link-tproxy.nft ]; then
+    rm -f /etc/nftables.d/99-space-link-tproxy.nft
+    if command -v fw4 >/dev/null 2>&1; then
+      fw4 reload >/dev/null 2>&1 || true
+    fi
+  fi
+
+  # 3) Алиас для routing-таблицы (читаемость `ip rule show`).
   mkdir -p /etc/iproute2 2>/dev/null || true
   if [ -f /etc/iproute2/rt_tables ]; then
     if ! grep -q "^[[:space:]]*$TPROXY_TABLE[[:space:]]\+space-link" /etc/iproute2/rt_tables 2>/dev/null; then
-      # Удалим возможный старый алиас на эту цифру и допишем свой.
       sed -i "/^[[:space:]]*$TPROXY_TABLE[[:space:]]/d" /etc/iproute2/rt_tables 2>/dev/null || true
       printf '%s space-link\n' "$TPROXY_TABLE" >> /etc/iproute2/rt_tables
     fi
   fi
 
-  # 2) Hotplug-скрипт: переподнимет ip rule + route после перезагрузки или
-  #    при подъёме любого интерфейса (network reload и т.п.).
-  mkdir -p /etc/hotplug.d/iface 2>/dev/null || true
-  cat > /etc/hotplug.d/iface/99-space-link-tproxy <<HOOK
-#!/bin/sh
-[ "\$ACTION" = "ifup" ] || exit 0
-ip rule add fwmark $TPROXY_MARK table $TPROXY_TABLE 2>/dev/null
-ip -6 rule add fwmark $TPROXY_MARK table $TPROXY_TABLE 2>/dev/null
-ip route add local 0.0.0.0/0 dev lo table $TPROXY_TABLE 2>/dev/null
-HOOK
-  chmod 0755 /etc/hotplug.d/iface/99-space-link-tproxy 2>/dev/null || true
+  # 4) Standalone nft-конфиг — кладём ВНЕ /etc/nftables.d/, чтобы fw4 его
+  #    не подсасывал. `table ... ; delete table ...` в начале — идиома для
+  #    идемпотентности: если таблица есть, она пересоздаётся; если нет —
+  #    delete молча игнорится благодаря объявлению на первой строке.
+  mkdir -p /etc/space-link 2>/dev/null || true
+  cat > /etc/space-link/tproxy.nft <<NFT
+table inet space_link
+delete table inet space_link
 
-  # 3) Применить прямо сейчас (идемпотентно).
-  ip rule del fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" 2>/dev/null || true
-  ip rule add fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" 2>/dev/null || true
-  ip route flush table "$TPROXY_TABLE" 2>/dev/null || true
-  ip route add local 0.0.0.0/0 dev lo table "$TPROXY_TABLE" 2>/dev/null || true
-
-  # 4) nftables-конфиг. OpenWrt 25.x использует fw4, который сам подсасывает
-  #    drop-in файлы из /etc/nftables.d/.
-  mkdir -p /etc/nftables.d 2>/dev/null || true
-  cat > /etc/nftables.d/99-space-link-tproxy.nft <<NFT
 table inet space_link {
     chain prerouting {
         type filter hook prerouting priority mangle; policy accept;
@@ -596,44 +622,77 @@ table inet space_link {
         ip daddr 255.255.255.255  return
         fib daddr type local      return
 
-        iifname "br-lan" meta l4proto { tcp, udp } tproxy ip to :$TPROXY_PORT meta mark set $TPROXY_MARK accept
+        iifname "br-lan" meta l4proto { tcp, udp } tproxy ip to :__TPROXY_PORT__ meta mark set __TPROXY_MARK__ accept
     }
 
     chain output {
         type route hook output priority mangle; policy accept;
 
-        meta mark $TPROXY_MARK return
-        skuid 0 ip daddr 0.0.0.0/8        return
-        skuid 0 ip daddr 10.0.0.0/8       return
-        skuid 0 ip daddr 127.0.0.0/8      return
-        skuid 0 ip daddr 169.254.0.0/16   return
-        skuid 0 ip daddr 172.16.0.0/12    return
-        skuid 0 ip daddr 192.168.0.0/16   return
-        skuid 0 ip daddr 224.0.0.0/4      return
-        skuid 0 ip daddr 240.0.0.0/4      return
-        skuid 0 fib daddr type local      return
+        meta mark __TPROXY_MARK__ return
+        ip daddr 0.0.0.0/8        return
+        ip daddr 10.0.0.0/8       return
+        ip daddr 127.0.0.0/8      return
+        ip daddr 169.254.0.0/16   return
+        ip daddr 172.16.0.0/12    return
+        ip daddr 192.168.0.0/16   return
+        ip daddr 224.0.0.0/4      return
+        ip daddr 240.0.0.0/4      return
+        fib daddr type local      return
     }
 }
 NFT
+  sed -i "s/__TPROXY_PORT__/$TPROXY_PORT/g; s/__TPROXY_MARK__/$TPROXY_MARK/g" /etc/space-link/tproxy.nft
 
-  # Валидация — если синтаксис битый, не ломаем общий fw4, просто warn.
-  if command -v nft >/dev/null 2>&1; then
-    if ! nft -c -f /etc/nftables.d/99-space-link-tproxy.nft >/dev/null 2>&1; then
-      warn "nft не принял конфиг TPROXY — оставляю файл для отладки, fw4 не reloading"
-      ok "TPROXY: hotplug+ip rule установлены (port=$TPROXY_PORT, mark=$TPROXY_MARK), nft пропущен"
-      return 0
-    fi
+  # 5) init.d-скрипт. apply: грузит nft + ставит fwmark rule + local-route.
+  #    stop: сносит таблицу и rule. reload == apply.
+  cat > /etc/init.d/space-link-tproxy <<'INITD'
+#!/bin/sh /etc/rc.common
+START=99
+STOP=10
+
+apply() {
+  nft -f /etc/space-link/tproxy.nft 2>&1 | logger -t space-link-tproxy
+  ip rule del fwmark __MARK__ table __TABLE__ 2>/dev/null
+  ip rule add fwmark __MARK__ table __TABLE__ 2>/dev/null
+  ip route flush table __TABLE__ 2>/dev/null
+  ip route add local 0.0.0.0/0 dev lo table __TABLE__ 2>/dev/null
+}
+
+start() { apply; }
+stop() {
+  nft delete table inet space_link 2>/dev/null
+  ip rule del fwmark __MARK__ table __TABLE__ 2>/dev/null
+  ip route flush table __TABLE__ 2>/dev/null
+}
+reload() { apply; }
+INITD
+  sed -i "s/__MARK__/$TPROXY_MARK/g; s/__TABLE__/$TPROXY_TABLE/g" /etc/init.d/space-link-tproxy
+  chmod 0755 /etc/init.d/space-link-tproxy
+
+  # 6) Firewall hotplug: после fw4 reload (например при network restart) наша
+  #    table inet space_link может слететь — переподнимаем.
+  mkdir -p /etc/hotplug.d/firewall 2>/dev/null || true
+  cat > /etc/hotplug.d/firewall/99-space-link-tproxy <<'HOOK'
+#!/bin/sh
+# fw4 reload может снести нашу table inet space_link — переподнимаем.
+/etc/init.d/space-link-tproxy reload 2>/dev/null
+HOOK
+  chmod 0755 /etc/hotplug.d/firewall/99-space-link-tproxy
+
+  # 7) Снять старый iface-hotplug от v0.1.13, если остался.
+  rm -f /etc/hotplug.d/iface/99-space-link-tproxy 2>/dev/null || true
+
+  # 8) Enable + start.
+  /etc/init.d/space-link-tproxy enable 2>/dev/null || true
+  /etc/init.d/space-link-tproxy start 2>/dev/null || true
+
+  # 9) Verify.
+  sleep 1
+  if nft list table inet space_link >/dev/null 2>&1; then
+    ok "TPROXY активен (table inet space_link загружена, port=$TPROXY_PORT, mark=$TPROXY_MARK, table=$TPROXY_TABLE)"
+  else
+    warn "TPROXY не применился — посмотри: logread -t space-link-tproxy"
   fi
-
-  # Применить через fw4 (предпочтительно — переживёт system restart/firewall reload).
-  if command -v fw4 >/dev/null 2>&1; then
-    fw4 reload >/dev/null 2>&1 || warn "fw4 reload вернул ошибку — проверь logread -e fw4"
-  elif command -v nft >/dev/null 2>&1; then
-    # Голый nftables — выкатим напрямую (переживёт reboot только если /etc/init.d/firewall пуст).
-    nft -f /etc/nftables.d/99-space-link-tproxy.nft 2>/dev/null || warn "nft не применился"
-  fi
-
-  ok "TPROXY настроен (port=$TPROXY_PORT, mark=$TPROXY_MARK, table=$TPROXY_TABLE)"
 }
 
 # ---- enable services -------------------------------------------------------
@@ -911,7 +970,7 @@ final_summary() {
   if command -v nft >/dev/null 2>&1 && nft list table inet space_link >/dev/null 2>&1; then
     printf '   TPROXY:          OK  nft table space_link загружена\n'
   else
-    printf '   TPROXY:          ERR таблица не загружена — проверь fw4 reload / logread -e firewall\n'
+    printf '   TPROXY:          ERR таблица не загружена — посмотри: logread -t space-link-tproxy\n'
   fi
 
   printf '\n'
