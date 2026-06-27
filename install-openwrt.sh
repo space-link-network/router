@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.1.9"
+VERSION="0.1.10"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -502,6 +502,16 @@ configure_panel_ip() {
     EFFECTIVE_BIND="$PANEL_IP"
     EFFECTIVE_PORT="$PANEL_PORT"
     ok "доп. IP $PANEL_IP/24 на br-lan, основной $ROUTER_IP жив — LuCI и панель параллельно"
+    # Прошлые версии (v0.1.7 fallback) могли disable+stop uhttpd. Сейчас :80
+    # на основном IP свободен — поднимаем LuCI обратно.
+    /etc/init.d/uhttpd enable >/dev/null 2>&1 || true
+    /etc/init.d/uhttpd start  >/dev/null 2>&1 || true
+    sleep 1
+    if pgrep uhttpd >/dev/null 2>&1; then
+      ok "uhttpd (LuCI) запущен на http://$ROUTER_IP/"
+    else
+      warn "uhttpd не стартовал — LuCI недоступна, не критично"
+    fi
     return 0
   fi
 
@@ -779,6 +789,14 @@ final_summary() {
     printf '   xray:            OK  работает\n'
   else
     printf '   xray:            --  не запущен (норма пока не выбран сервер)\n'
+  fi
+
+  if [ "$EFFECTIVE_BIND" = "$router_ip" ]; then
+    printf '   LuCI:            --  выключена (мы заняли :80 на %s)\n' "$router_ip"
+  elif pgrep uhttpd >/dev/null 2>&1; then
+    printf '   LuCI:            OK  работает на http://%s/\n' "$router_ip"
+  else
+    printf '   LuCI:            ERR uhttpd не запущен (вручную: service uhttpd start)\n'
   fi
 
   if command -v nslookup >/dev/null 2>&1 && \
