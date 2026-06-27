@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.2.1"
+VERSION="0.2.2"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -730,6 +730,21 @@ enable_services() {
         printf '%s\n' '{"log":{"level":"warn"},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}]}' > /etc/sing-box/config.json
     fi
   fi
+  # CAP_NET_ADMIN нужен для tproxy-инбаунда :12345 — без него init.d падает с
+  # "listen tcp4 0.0.0.0:12345: operation not permitted". libcap-bin ставим
+  # тут же, если ещё нет setcap.
+  if ! command -v setcap >/dev/null 2>&1; then
+    apk add libcap-bin >/dev/null 2>&1 || opkg install libcap-bin >/dev/null 2>&1 || true
+  fi
+  if command -v setcap >/dev/null 2>&1 && [ -x /usr/bin/sing-box ]; then
+    setcap "cap_net_admin,cap_net_bind_service,cap_net_raw+ep" /usr/bin/sing-box >/dev/null 2>&1 \
+      && ok "setcap CAP_NET_ADMIN на /usr/bin/sing-box" \
+      || warn "setcap не сработал — init.d sing-box может падать"
+  fi
+
+  # uci sing-box.main.enabled=1 — без этого init.d молча выходит из start_service.
+  uci -q set sing-box.main.enabled='1' && uci -q commit sing-box
+
   /etc/init.d/sing-box enable >/dev/null 2>&1 || true
   /etc/init.d/sing-box restart >/dev/null 2>&1 || /etc/init.d/sing-box start >/dev/null 2>&1 \
     || warn "sing-box не стартовал — посмотри logread -e sing-box"
