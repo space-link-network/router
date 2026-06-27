@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.1.0"
+VERSION="0.1.5"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -14,11 +14,17 @@ WWW_DIR="$INSTALL_DIR/www"
 RULES_DIR="$INSTALL_DIR/rules"
 BIN_PATH="$INSTALL_DIR/space-link-api"
 
-# Где живёт наша панель. Берём отдельный alias-IP на LAN-интерфейсе чтобы
-# не конфликтовать с uhttpd (LuCI), который занят на основном адресе роутера.
+# Где живёт наша панель. По умолчанию — alias-IP на LAN-интерфейсе чтобы
+# не конфликтовать с uhttpd (LuCI). Если alias не поднимется, упадём в
+# fallback (Вариант A): выключим uhttpd и займём :80 на основном IP.
 # IP подобран ВНЕ DHCP-пула OpenWrt (.100-.249) чтобы DHCP его не выдал клиенту.
 PANEL_IP="${PANEL_IP:-192.168.1.2}"
 PANEL_PORT="${PANEL_PORT:-80}"
+# Реальные bind/port, на которых в итоге запустится lighttpd. Считаются после
+# configure_panel_ip; до этого = желаемому PANEL_IP/PANEL_PORT.
+EFFECTIVE_BIND="$PANEL_IP"
+EFFECTIVE_PORT="$PANEL_PORT"
+ROUTER_IP=""
 
 # Packages we hard-require: install must abort if any is missing.
 REQUIRED_PKGS="ca-certificates curl xray-core lighttpd lighttpd-mod-proxy lighttpd-mod-rewrite lighttpd-mod-redirect"
@@ -105,6 +111,22 @@ if [ -f "$STATE_DIR/version" ]; then
   fi
 fi
 
+# ---- helpers: service wait ------------------------------------------------
+# Опрашивает init.d-сервис до ~10 сек, потом сдаётся. Возвращает 0 если жив.
+wait_service_up() {
+  svc="$1"
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if /etc/init.d/"$svc" status 2>/dev/null | grep -q running; then
+      return 0
+    fi
+    if pgrep -x "$svc" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 # ---- preflight -------------------------------------------------------------
 preflight() {
   step "Проверки окружения"
@@ -123,11 +145,40 @@ preflight() {
     fi
   fi
 
+  # DNS: убедимся что resolv.conf валиден. Если нет — пишем fallback в
+  # /tmp/resolv.conf (его /etc/resolv.conf обычно симлинкает).
+  ensure_dns
+
   ARCH=$(detect_arch)
   if [ "$ARCH" = "unknown" ]; then
     die "Неизвестная архитектура: $(uname -m)"
   fi
   ok "Архитектура: $ARCH"
+}
+
+ensure_dns() {
+  # Если dnsmasq отвечает на 127.0.0.1:53 — всё хорошо.
+  if command -v nslookup >/dev/null 2>&1; then
+    if nslookup gitlab.com 127.0.0.1 >/dev/null 2>&1; then
+      ok "DNS (через dnsmasq)"
+      return 0
+    fi
+  fi
+  # Проверим /etc/resolv.conf на наличие внешнего nameserver-а.
+  if [ -r /etc/resolv.conf ]; then
+    if grep -E '^nameserver[[:space:]]+' /etc/resolv.conf 2>/dev/null \
+       | grep -vqE '127\.0\.0\.1|::1'; then
+      ok "DNS (resolv.conf)"
+      return 0
+    fi
+  fi
+  warn "Нет рабочего DNS — ставлю fallback 1.1.1.1"
+  if [ -L /etc/resolv.conf ] || [ ! -e /etc/resolv.conf ]; then
+    mkdir -p /tmp
+    printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /tmp/resolv.conf
+  else
+    printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' >> /etc/resolv.conf
+  fi
 }
 
 # ---- token prompt ----------------------------------------------------------
@@ -297,10 +348,10 @@ install_templates() {
   else
     fetch "$RELEASE_BASE/lighttpd.conf" /etc/lighttpd/conf.d/space-link.conf || warn "lighttpd.conf пропущен"
   fi
-  # подставляем PANEL_IP/PORT в шаблон
-  sed -i "s/__PANEL_IP__/$PANEL_IP/g; s/__PANEL_PORT__/$PANEL_PORT/g" \
+  # Подставляем реальный bind/port (после configure_panel_ip).
+  sed -i "s/__PANEL_IP__/$EFFECTIVE_BIND/g; s/__PANEL_PORT__/$EFFECTIVE_PORT/g" \
     /etc/lighttpd/conf.d/space-link.conf
-  ok "lighttpd ($PANEL_IP:$PANEL_PORT)"
+  ok "lighttpd ($EFFECTIVE_BIND:$EFFECTIVE_PORT)"
 
   # init.d
   if [ -f "$SCRIPT_DIR/../templates/space-link.init" ]; then
@@ -313,10 +364,16 @@ install_templates() {
 }
 
 # ---- panel IP alias --------------------------------------------------------
+# Пытается поднять alias-IP. Если не поднялся за 2 сек — fallback (Вариант A):
+# выключаем uhttpd, занимаем :80 на основном IP роутера. EFFECTIVE_BIND и
+# EFFECTIVE_PORT в конце отражают реальное место панели.
 configure_panel_ip() {
+  ROUTER_IP=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
+
   step "Alias-IP для панели: $PANEL_IP"
   if ! command -v uci >/dev/null 2>&1; then
-    warn "uci недоступен — alias не настроен, панель будет на основном IP"
+    warn "uci недоступен — переключаюсь на основной IP роутера ($ROUTER_IP)"
+    fallback_to_router_ip
     return 0
   fi
 
@@ -333,7 +390,26 @@ configure_panel_ip() {
   # Перечитываем сеть. На некоторых сборках reload может на пару секунд
   # обронить SSH — это нормально, всё восстановится.
   service network reload >/dev/null 2>&1 || /etc/init.d/network reload >/dev/null 2>&1 || true
-  ok "alias $PANEL_IP добавлен на br-lan"
+
+  # Проверка: реально ли поднялся alias на br-lan.
+  sleep 2
+  if ip addr show br-lan 2>/dev/null | grep -q "inet $PANEL_IP/"; then
+    EFFECTIVE_BIND="$PANEL_IP"
+    EFFECTIVE_PORT="$PANEL_PORT"
+    ok "alias $PANEL_IP/24 поднят на br-lan"
+  else
+    warn "alias $PANEL_IP не поднялся — fallback на основной IP роутера ($ROUTER_IP)"
+    fallback_to_router_ip
+  fi
+}
+
+# Вариант A: гасим uhttpd (LuCI), слушаем на основном IP роутера :80.
+fallback_to_router_ip() {
+  EFFECTIVE_BIND="$ROUTER_IP"
+  EFFECTIVE_PORT="80"
+  warn "выключаю uhttpd (LuCI будет недоступна до удаления нашего конфига)"
+  /etc/init.d/uhttpd stop  >/dev/null 2>&1 || true
+  /etc/init.d/uhttpd disable >/dev/null 2>&1 || true
 }
 
 # ---- enable services -------------------------------------------------------
@@ -353,6 +429,25 @@ enable_services() {
   /etc/init.d/space-link enable >/dev/null 2>&1 || true
   /etc/init.d/space-link restart >/dev/null 2>&1 || /etc/init.d/space-link start >/dev/null 2>&1 \
     || warn "space-link не стартовал — посмотри logread -e space-link"
+
+  # Ждём, пока Go API реально начнёт отвечать на 127.0.0.1:8080. lighttpd
+  # проксирует /api/* туда — если стартовать lighttpd раньше, первые
+  # запросы UI получат 502.
+  step "Ждём space-link API"
+  api_ok=0
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsS -m 2 http://127.0.0.1:8080/api/local/health >/dev/null 2>&1 && { api_ok=1; break; }
+    else
+      wget -q --timeout=2 -O- http://127.0.0.1:8080/api/local/health >/dev/null 2>&1 && { api_ok=1; break; }
+    fi
+    sleep 1
+  done
+  if [ "$api_ok" = "1" ]; then
+    ok "space-link-api отвечает"
+  else
+    warn "space-link-api не ответил за 10 сек — UI может первое время отдавать 502"
+  fi
 
   /etc/init.d/lighttpd enable >/dev/null 2>&1 || true
   /etc/init.d/lighttpd restart >/dev/null 2>&1 || /etc/init.d/lighttpd start >/dev/null 2>&1 \
@@ -386,35 +481,63 @@ save_state() {
 }
 
 # ---- dnsmasq alias ---------------------------------------------------------
+# Идемпотентно: удаляем точечно все возможные старые address-записи my.spacelink
+# (на возможных IP-адресах), добавляем одну на EFFECTIVE_BIND. После рестарта
+# проверяем что dnsmasq поднялся — если нет, чистим address целиком и пробуем
+# снова без нашей записи (панель тогда открывается по IP, не по имени).
 configure_dns() {
-  step "Регистрация my.spacelink → $PANEL_IP в dnsmasq"
+  step "Регистрация my.spacelink → $EFFECTIVE_BIND в dnsmasq"
 
   if command -v uci >/dev/null 2>&1; then
-    # Полностью переписываем address-list, выбрасывая ВСЕ старые my.spacelink
-    # записи (могли остаться с предыдущих версий установщика с другим IP),
-    # пользовательские оставляем нетронутыми.
-    addrs=$(uci -q get dhcp.@dnsmasq[0].address 2>/dev/null || true)
-    if [ -n "$addrs" ]; then
-      uci -q delete dhcp.@dnsmasq[0].address >/dev/null 2>&1 || true
-      for a in $addrs; do
-        case "$a" in
-          */my.spacelink/*) ;; # пропускаем
-          *) uci add_list dhcp.@dnsmasq[0].address="$a" >/dev/null 2>&1 ;;
-        esac
-      done
-    fi
-    uci add_list dhcp.@dnsmasq[0].address="/my.spacelink/$PANEL_IP" >/dev/null 2>&1
-    uci commit dhcp >/dev/null 2>&1 || true
+    _dns_uci_apply
     /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
-    ok "my.spacelink → $PANEL_IP (через uci)"
+    if wait_service_up dnsmasq; then
+      ok "my.spacelink → $EFFECTIVE_BIND (через uci)"
+      return 0
+    fi
+    warn "dnsmasq не поднялся — чищу address-list и пробую заново"
+    _dns_uci_purge
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+    if wait_service_up dnsmasq; then
+      warn "dnsmasq жив, но my.spacelink не зарегистрирован — открывай по IP: http://$EFFECTIVE_BIND"
+    else
+      warn "dnsmasq всё ещё не поднялся — проверь logread -e dnsmasq и uci show dhcp"
+    fi
   elif [ -f /etc/dnsmasq.conf ]; then
     sed -i "/my\\.spacelink/d" /etc/dnsmasq.conf
-    printf 'address=/my.spacelink/%s\n' "$PANEL_IP" >> /etc/dnsmasq.conf
+    printf 'address=/my.spacelink/%s\n' "$EFFECTIVE_BIND" >> /etc/dnsmasq.conf
     /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
-    ok "my.spacelink → $PANEL_IP (через dnsmasq.conf)"
+    ok "my.spacelink → $EFFECTIVE_BIND (через dnsmasq.conf)"
   else
-    warn "ни uci, ни dnsmasq.conf не доступны — открывай панель по IP: http://$PANEL_IP"
+    warn "ни uci, ни dnsmasq.conf не доступны — открывай панель по IP: http://$EFFECTIVE_BIND"
   fi
+}
+
+# Удаляет точечно записи /my.spacelink/<ip> для известных кандидатов, добавляет
+# одну на EFFECTIVE_BIND. del_list с несуществующим значением безопасно
+# игнорируется — никаких циклов по индексам и shell-escaping не требуется.
+_dns_uci_apply() {
+  for ip in 192.168.1.1 192.168.1.2 192.168.1.3 192.168.1.100 192.168.1.101 192.168.0.1 "$ROUTER_IP" "$EFFECTIVE_BIND"; do
+    [ -n "$ip" ] || continue
+    uci -q del_list dhcp.@dnsmasq[0].address="/my.spacelink/$ip" 2>/dev/null || true
+  done
+  uci add_list dhcp.@dnsmasq[0].address="/my.spacelink/$EFFECTIVE_BIND" >/dev/null 2>&1
+  uci commit dhcp >/dev/null 2>&1 || true
+}
+
+# На случай если address-list где-то побился — выгребаем целиком все
+# my.spacelink-записи, обычные оставляем.
+_dns_uci_purge() {
+  addrs=$(uci -q get dhcp.@dnsmasq[0].address 2>/dev/null || true)
+  [ -n "$addrs" ] || return 0
+  uci -q delete dhcp.@dnsmasq[0].address >/dev/null 2>&1 || true
+  for a in $addrs; do
+    case "$a" in
+      */my.spacelink/*) ;;
+      *) uci add_list dhcp.@dnsmasq[0].address="$a" >/dev/null 2>&1 ;;
+    esac
+  done
+  uci commit dhcp >/dev/null 2>&1 || true
 }
 
 # ---- heartbeat cron --------------------------------------------------------
@@ -432,15 +555,22 @@ install_cron() {
 
 # ---- final summary ---------------------------------------------------------
 final_summary() {
-  router_ip=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
+  router_ip="${ROUTER_IP:-$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")}"
   wifi=$(uci -q get wireless.@wifi-iface[0].ssid 2>/dev/null || echo "—")
+  port_suffix=""
+  [ "$EFFECTIVE_PORT" = "80" ] || port_suffix=":$EFFECTIVE_PORT"
+  panel_url="http://$EFFECTIVE_BIND$port_suffix"
   printf '\n'
   printf '%s\n' "================================================"
   printf '   Space Link Router установлен (%s)\n' "$VERSION"
   printf '%s\n' "================================================"
   printf '   WiFi:       %s\n' "$wifi"
-  printf '   Панель:     http://my.spacelink   (или http://%s)\n' "$PANEL_IP"
-  printf '   LuCI:       http://%s   (стандартный веб-интерфейс OpenWrt)\n' "$router_ip"
+  printf '   Панель:     http://my.spacelink%s   (или %s)\n' "$port_suffix" "$panel_url"
+  if [ "$EFFECTIVE_BIND" = "$router_ip" ]; then
+    printf '   LuCI:       выключена (мы заняли :80 на основном IP)\n'
+  else
+    printf '   LuCI:       http://%s   (стандартный веб-интерфейс OpenWrt)\n' "$router_ip"
+  fi
   if [ -z "$TOKEN" ]; then
     printf '   Токен:      не задан — введи в панели управления\n'
   else
@@ -459,8 +589,8 @@ install_packages
 install_binary
 install_ui
 install_rules
-install_templates
 configure_panel_ip
+install_templates
 save_state
 configure_dns
 enable_services

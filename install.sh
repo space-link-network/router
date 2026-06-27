@@ -42,6 +42,7 @@ run_sub() {
 
   # When the dispatcher script itself is being piped in (no $0 dir), we need
   # to pipe the sub-installer through sh as well. -s -- forwards CLI args.
+  # curl первым — busybox-wget на свежем OpenWrt не умеет HTTPS.
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL "$url" | sh -s -- "$@"
   elif command -v wget >/dev/null 2>&1; then
