@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.1.8"
+VERSION="0.1.9"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -456,10 +456,15 @@ install_templates() {
 # выключаем uhttpd, занимаем :80 на основном IP роутера. EFFECTIVE_BIND и
 # EFFECTIVE_PORT в конце отражают реальное место панели.
 configure_panel_ip() {
-  ROUTER_IP=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
+  # uci get может вернуть "192.168.1.1/24" (если уже list) или несколько
+  # адресов через пробел — берём первый и отрезаем маску. Это и есть
+  # настоящий primary-IP роутера, без артефактов прошлых установок.
+  ROUTER_IP_RAW=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
+  ROUTER_IP=$(printf '%s\n' "$ROUTER_IP_RAW" | awk '{print $1}' | cut -d'/' -f1)
+  [ -n "$ROUTER_IP" ] || ROUTER_IP="192.168.1.1"
   ROUTER_MASK=$(uci -q get network.lan.netmask 2>/dev/null || echo "255.255.255.0")
 
-  step "Доп. IP для панели: $PANEL_IP"
+  step "Доп. IP для панели: $PANEL_IP (основной: $ROUTER_IP)"
   if ! command -v uci >/dev/null 2>&1; then
     warn "uci недоступен — переключаюсь на основной IP роутера ($ROUTER_IP)"
     fallback_to_router_ip
@@ -472,19 +477,10 @@ configure_panel_ip() {
     uci -q delete network.lan_panel
   fi
 
-  # Добавляем PANEL_IP как secondary в существующий lan через list ipaddr.
-  # Если в lan уже singular `option ipaddr` — он автоматически становится
-  # первым элементом list при add_list. Маска уходит в /24 (либо
-  # перерасчёт из текущей netmask, для простоты считаем стандарт /24).
+  # Перезаписываем list ipaddr с нуля: основной IP + наш panel-IP, оба с /24.
+  # Старые значения (включая возможные дубли и битые) выбрасываем.
   cidr_main="$ROUTER_IP/24"
   cidr_panel="$PANEL_IP/24"
-
-  # Соберём актуальный list ipaddr (может уже быть многосписочным).
-  current_addrs=$(uci -q get network.lan.ipaddr 2>/dev/null || true)
-  # Если current это одиночный без /, добавим /24.
-  case "$current_addrs" in
-    */24|*/16|*/8) cidr_main="$current_addrs" ;;
-  esac
 
   # Перезаписываем целиком, чтобы убрать возможные дубли наших прошлых попыток.
   uci -q delete network.lan.ipaddr 2>/dev/null || true
@@ -518,7 +514,10 @@ configure_panel_ip() {
 
 # Вариант A: гасим uhttpd (LuCI), слушаем на основном IP роутера :80.
 fallback_to_router_ip() {
-  EFFECTIVE_BIND="$ROUTER_IP"
+  # Двойная санитизация — на случай если configure_panel_ip ещё не успел.
+  clean=$(printf '%s\n' "${ROUTER_IP:-192.168.1.1}" | awk '{print $1}' | cut -d'/' -f1)
+  [ -n "$clean" ] || clean="192.168.1.1"
+  EFFECTIVE_BIND="$clean"
   EFFECTIVE_PORT="80"
   warn "выключаю uhttpd (LuCI будет недоступна до удаления нашего конфига)"
   /etc/init.d/uhttpd stop  >/dev/null 2>&1 || true
