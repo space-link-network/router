@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.2.5"
+VERSION="0.2.6"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -300,7 +300,7 @@ prompt_token() {
     return 0
   fi
   if [ "$SKIP_TOKEN" = "1" ]; then
-    printf 'Токен пропущен (--skip-token). Настройте позже: http://my.spacelink/\n'
+    printf 'Токен пропущен (--skip-token). Настройте позже: http://spacelink.lan/\n'
     return 0
   fi
 
@@ -312,7 +312,7 @@ prompt_token() {
   elif [ -r /dev/tty ]; then
     _tty_in="/dev/tty"
   else
-    printf '\nНет терминала для ввода токена. Открой http://my.spacelink/ и введи токен или ссылку подписки в разделе Setup.\n'
+    printf '\nНет терминала для ввода токена. Открой http://spacelink.lan/ и введи токен или ссылку подписки в разделе Setup.\n'
     return 0
   fi
 
@@ -329,7 +329,7 @@ prompt_token() {
       warn "Токен не прошёл проверку. Сохраняю как есть — можно заменить позже в UI."
     fi
   else
-    printf 'Пропущено. Открой http://my.spacelink/ и введи токен или ссылку подписки в Setup.\n'
+    printf 'Пропущено. Открой http://spacelink.lan/ и введи токен или ссылку подписки в Setup.\n'
   fi
 }
 
@@ -800,6 +800,23 @@ CAP
   /etc/init.d/lighttpd restart >/dev/null 2>&1 || /etc/init.d/lighttpd start >/dev/null 2>&1 \
     || warn "lighttpd не стартовал — посмотри logread -e lighttpd"
 
+  # wait + retry: lighttpd иногда падает с EADDRINUSE если порт ещё не
+  # освободился от предыдущей попытки. Даём 5 секунд + retry до 3 раз.
+  for try in 1 2 3; do
+    sleep 2
+    if pgrep -x lighttpd >/dev/null 2>&1; then
+      ok "lighttpd работает (try=$try)"
+      break
+    fi
+    if [ "$try" = "3" ]; then
+      warn "lighttpd не поднимается за 3 попытки — logread -e lighttpd; конфликт портов?"
+      # Диагностический вывод: что слушает :80
+      netstat -lnp 2>/dev/null | grep ":80\b" | sed 's/^/   /' | head -3
+    else
+      /etc/init.d/lighttpd restart >/dev/null 2>&1 || /etc/init.d/lighttpd start >/dev/null 2>&1
+    fi
+  done
+
   ok "сервисы"
 }
 
@@ -829,22 +846,22 @@ save_state() {
 
 # ---- dnsmasq alias ---------------------------------------------------------
 # Защищённая версия. Шаги:
-#   1) выгребаем все my.spacelink-записи (uci del_list) и битые address'ы
+#   1) выгребаем все spacelink.lan-записи (uci del_list) и битые address'ы
 #      (sed по сырому /etc/config/dhcp — кавычки, лишние слэши).
-#   2) добавляем /my.spacelink/$EFFECTIVE_BIND.
+#   2) добавляем /spacelink.lan/$EFFECTIVE_BIND.
 #   3) commit + restart + sleep 2 + verify (pgrep dnsmasq && nslookup gitlab.com).
 #   4) если verify провалился — откат через rollback_uci (наш свежий снапшот),
 #      затем /rom/etc/config/dhcp как последний резерв. После каждого отката
-#      делаем ещё одну попытку добавить my.spacelink.
+#      делаем ещё одну попытку добавить spacelink.lan.
 configure_dns() {
-  step "Регистрация my.spacelink → $EFFECTIVE_BIND в dnsmasq"
+  step "Регистрация spacelink.lan → $EFFECTIVE_BIND в dnsmasq"
 
   if ! command -v uci >/dev/null 2>&1; then
     if [ -f /etc/dnsmasq.conf ]; then
       sed -i "/my\\.spacelink/d" /etc/dnsmasq.conf 2>/dev/null || true
-      printf 'address=/my.spacelink/%s\n' "$EFFECTIVE_BIND" >> /etc/dnsmasq.conf
+      printf 'address=/spacelink.lan/%s\n' "$EFFECTIVE_BIND" >> /etc/dnsmasq.conf
       /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
-      ok "my.spacelink → $EFFECTIVE_BIND (через dnsmasq.conf)"
+      ok "spacelink.lan → $EFFECTIVE_BIND (через dnsmasq.conf)"
     else
       warn "ни uci, ни dnsmasq.conf не доступны — открывай панель по IP: http://$EFFECTIVE_BIND"
     fi
@@ -853,13 +870,13 @@ configure_dns() {
 
   _dns_uci_purge_all
   _dns_sed_scrub
-  uci -q add_list dhcp.@dnsmasq[0].address="/my.spacelink/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
+  uci -q add_list dhcp.@dnsmasq[0].address="/spacelink.lan/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
   uci -q commit dhcp >/dev/null 2>&1 || true
   /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
   sleep 2
 
   if _dns_verify; then
-    ok "my.spacelink → $EFFECTIVE_BIND (dnsmasq жив, DNS отвечает)"
+    ok "spacelink.lan → $EFFECTIVE_BIND (dnsmasq жив, DNS отвечает)"
     return 0
   fi
 
@@ -880,18 +897,18 @@ configure_dns() {
   fi
 
   if _dns_verify; then
-    # Базу подняли. Аккуратно докинем my.spacelink ещё раз.
-    uci -q add_list dhcp.@dnsmasq[0].address="/my.spacelink/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
+    # Базу подняли. Аккуратно докинем spacelink.lan ещё раз.
+    uci -q add_list dhcp.@dnsmasq[0].address="/spacelink.lan/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
     uci -q commit dhcp >/dev/null 2>&1 || true
     /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
     sleep 2
     if _dns_verify; then
-      ok "dnsmasq восстановлен, my.spacelink → $EFFECTIVE_BIND"
+      ok "dnsmasq восстановлен, spacelink.lan → $EFFECTIVE_BIND"
     else
-      # Снова легло именно от нашей записи. Лучше потерять my.spacelink
+      # Снова легло именно от нашей записи. Лучше потерять spacelink.lan
       # чем DHCP/DNS клиентам.
-      warn "my.spacelink ломает dnsmasq — оставляю без alias, открывай по IP: http://$EFFECTIVE_BIND"
-      uci -q del_list dhcp.@dnsmasq[0].address="/my.spacelink/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
+      warn "spacelink.lan ломает dnsmasq — оставляю без alias, открывай по IP: http://$EFFECTIVE_BIND"
+      uci -q del_list dhcp.@dnsmasq[0].address="/spacelink.lan/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
       uci -q commit dhcp >/dev/null 2>&1 || true
       /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
     fi
@@ -905,14 +922,19 @@ configure_dns() {
 _dns_uci_purge_all() {
   for ip in 192.168.1.1 192.168.1.2 192.168.1.3 192.168.1.100 192.168.1.101 192.168.0.1 "$ROUTER_IP" "$EFFECTIVE_BIND"; do
     [ -n "$ip" ] || continue
+    uci -q del_list dhcp.@dnsmasq[0].address="/spacelink.lan/$ip" >/dev/null 2>&1 || true
+    # legacy: my.spacelink — браузеры (особенно мобильный Safari) не
+    # распознавали как URL, удаляем при первом же апгрейде до v0.2.6+.
     uci -q del_list dhcp.@dnsmasq[0].address="/my.spacelink/$ip" >/dev/null 2>&1 || true
   done
-  # Дополнительно — выгрести любое значение списка, где есть подстрока my.spacelink.
+  # Дополнительно — выгрести любое значение списка с любым из доменов.
   addrs=$(uci -q get dhcp.@dnsmasq[0].address 2>/dev/null || true)
   if [ -n "$addrs" ]; then
     for a in $addrs; do
       case "$a" in
-        */my.spacelink/*) uci -q del_list dhcp.@dnsmasq[0].address="$a" >/dev/null 2>&1 || true ;;
+        */spacelink.lan/*|*/my.spacelink/*)
+          uci -q del_list dhcp.@dnsmasq[0].address="$a" >/dev/null 2>&1 || true
+          ;;
       esac
     done
   fi
@@ -920,7 +942,7 @@ _dns_uci_purge_all() {
 
 # Sed по сырому /etc/config/dhcp. Снимает строки, в которых list address
 # содержит обратный слэш (типовой признак побитого экранирования) или
-# подстроку my.spacelink (если uci по какой-то причине промахнулся).
+# подстроку spacelink.lan (если uci по какой-то причине промахнулся).
 _dns_sed_scrub() {
   [ -f /etc/config/dhcp ] || return 0
   cp /etc/config/dhcp "$BACKUP_DIR/dhcp.preinstall.$(date +%s 2>/dev/null || echo x)" 2>/dev/null || true
@@ -967,7 +989,7 @@ final_summary() {
   printf '   Space Link Router установлен (%s)\n' "$VERSION"
   printf '%s\n' "================================================"
   printf '   WiFi:       %s\n' "$wifi"
-  printf '   Панель:     http://my.spacelink%s   (или %s)\n' "$port_suffix" "$panel_url"
+  printf '   Панель:     http://spacelink.lan%s   (или %s)\n' "$port_suffix" "$panel_url"
   if [ "$EFFECTIVE_BIND" = "$router_ip" ]; then
     printf '   LuCI:       выключена (мы заняли :80 на основном IP)\n'
   else
@@ -1025,10 +1047,10 @@ final_summary() {
   fi
 
   if command -v nslookup >/dev/null 2>&1 && \
-     nslookup my.spacelink 127.0.0.1 2>/dev/null | grep -q "$EFFECTIVE_BIND"; then
-    printf '   my.spacelink:    OK  резолвит в %s\n' "$EFFECTIVE_BIND"
+     nslookup spacelink.lan 127.0.0.1 2>/dev/null | grep -q "$EFFECTIVE_BIND"; then
+    printf '   spacelink.lan:    OK  резолвит в %s\n' "$EFFECTIVE_BIND"
   else
-    printf '   my.spacelink:    --  не резолвит — открывай по %s\n' "$panel_url"
+    printf '   spacelink.lan:    --  не резолвит — открывай по %s\n' "$panel_url"
   fi
 
   if command -v nft >/dev/null 2>&1 && nft list table inet space_link >/dev/null 2>&1; then
@@ -1039,7 +1061,7 @@ final_summary() {
 
   printf '\n'
   if [ "$dns_ok" = "1" ] && [ "$api_ok" = "1" ] && [ "$http_ok" = "1" ]; then
-    printf '   Установка успешна. Открывай: http://my.spacelink%s\n' "$port_suffix"
+    printf '   Установка успешна. Открывай: http://spacelink.lan%s\n' "$port_suffix"
   else
     printf '   Установка завершена с предупреждениями. Запусти %s ещё раз — установщик попробует починить.\n' "$0"
   fi

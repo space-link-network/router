@@ -62,7 +62,9 @@ if command -v uci >/dev/null 2>&1; then
   if [ -n "$addrs" ]; then
     for a in $addrs; do
       case "$a" in
-        */my.spacelink/*) uci -q del_list dhcp.@dnsmasq[0].address="$a" >/dev/null 2>&1 || true ;;
+        */my.spacelink/*|*/spacelink.lan/*)
+          uci -q del_list dhcp.@dnsmasq[0].address="$a" >/dev/null 2>&1 || true
+          ;;
       esac
     done
     uci -q commit dhcp >/dev/null 2>&1 || true
@@ -70,6 +72,7 @@ if command -v uci >/dev/null 2>&1; then
 fi
 if [ -f /etc/dnsmasq.conf ]; then
   sed -i '/^address=\/my\.spacelink\//d' /etc/dnsmasq.conf 2>/dev/null || true
+  sed -i '/^address=\/spacelink\.lan\//d' /etc/dnsmasq.conf 2>/dev/null || true
 fi
 /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
 
