@@ -73,7 +73,7 @@ Options:
 
 Прямые ссылки (если хочешь без dispatcher'а):
   install-openwrt.sh   — для OpenWrt/ImmortalWrt (Netis, GL.iNet, Xiaomi-OW, …)
-  install-keenetic.sh  — для Keenetic (KeeneticOS + Entware)   [скоро]
+  install-keenetic.sh  — для Keenetic (KeeneticOS + Entware)   [ЭКСПЕРИМЕНТАЛЬНО]
   install-padavan.sh   — для Padavan-форков                    [скоро]
 EOF
     exit 0

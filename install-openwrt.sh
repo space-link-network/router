@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.2.6"
+VERSION="0.3.0"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -93,10 +93,11 @@ else
   }
   validate_token() {
     [ -z "${1:-}" ] && return 2
+    _hwid="rtr-$(cat /sys/class/net/br-lan/address 2>/dev/null | tr -d ':' | tr 'A-Z' 'a-z' || echo unknown)"
     if command -v curl >/dev/null 2>&1; then
-      curl -fsS -m 10 -H "Authorization: Bearer $1" "$CLOUD_API/router/validate" >/dev/null 2>&1
+      curl -fsS -m 10 -H "Authorization: Bearer $1" -H "X-Hwid: $_hwid" "$CLOUD_API/router/validate" >/dev/null 2>&1
     else
-      wget -q --timeout=10 --header="Authorization: Bearer $1" -O- "$CLOUD_API/router/validate" >/dev/null 2>&1
+      wget -q --timeout=10 --header="Authorization: Bearer $1" --header="X-Hwid: $_hwid" -O- "$CLOUD_API/router/validate" >/dev/null 2>&1
     fi
   }
 fi
@@ -300,7 +301,7 @@ prompt_token() {
     return 0
   fi
   if [ "$SKIP_TOKEN" = "1" ]; then
-    printf 'Токен пропущен (--skip-token). Настройте позже: http://spacelink.lan/\n'
+    printf 'Токен пропущен (--skip-token). Настройте позже: http://my.space/\n'
     return 0
   fi
 
@@ -312,7 +313,7 @@ prompt_token() {
   elif [ -r /dev/tty ]; then
     _tty_in="/dev/tty"
   else
-    printf '\nНет терминала для ввода токена. Открой http://spacelink.lan/ и введи токен или ссылку подписки в разделе Setup.\n'
+    printf '\nНет терминала для ввода токена. Открой http://my.space/ и введи токен или ссылку подписки в разделе Setup.\n'
     return 0
   fi
 
@@ -329,7 +330,7 @@ prompt_token() {
       warn "Токен не прошёл проверку. Сохраняю как есть — можно заменить позже в UI."
     fi
   else
-    printf 'Пропущено. Открой http://spacelink.lan/ и введи токен или ссылку подписки в Setup.\n'
+    printf 'Пропущено. Открой http://my.space/ и введи токен или ссылку подписки в Setup.\n'
   fi
 }
 
@@ -434,7 +435,7 @@ install_rules() {
   if [ -d "$SCRIPT_DIR/../rules/presets" ]; then
     cp "$SCRIPT_DIR/../rules/presets"/*.txt "$RULES_DIR/presets/" 2>/dev/null || true
   else
-    for preset in ru cis; do
+    for preset in ru cis ai social; do
       fetch "$RELEASE_BASE/rules-$preset.txt" "$RULES_DIR/presets/$preset.txt" 2>/dev/null \
         || warn "пресет $preset не скачался — не критично, можно выбрать позже"
     done
@@ -581,6 +582,31 @@ configure_tproxy() {
   TPROXY_MARK="${TPROXY_MARK:-255}"
   TPROXY_TABLE="${TPROXY_TABLE:-100}"
 
+  # Anti-leak тумблеры (по умолчанию ВЫКЛ, чтобы не ломать домашние сети).
+  #   dns_tunnel  — весь DNS через туннель.
+  #   block_quic  — режем UDP/443 (QUIC) из LAN → браузеры откатываются на
+  #                 TCP/TLS. ОБЫЧНО НЕ НУЖНО: sing-box-outbound теперь шлёт
+  #                 packet_encoding=xudp, поэтому UDP/QUIC корректно идёт через
+  #                 VLESS (как на телефоне в Happ). block_quic=1 оставлен как
+  #                 страховка, если на конкретном сервере QUIC всё же глючит —
+  #                 тогда трафик гарантированно уходит по TCP.
+  # Переопределяется: uci set space-link.tproxy.block_quic=1; commit; reload —
+  # или из окружения TPROXY_DNS_TUNNEL / TPROXY_BLOCK_QUIC при установке.
+  DNS_TUNNEL="${TPROXY_DNS_TUNNEL:-$(uci -q get space-link.tproxy.dns_tunnel 2>/dev/null || echo 0)}"
+  BLOCK_QUIC="${TPROXY_BLOCK_QUIC:-$(uci -q get space-link.tproxy.block_quic 2>/dev/null || echo 0)}"
+
+  # Зафиксируем дефолты в uci, чтобы UI/CLI могли их читать и переключать.
+  if ! uci -q get space-link.tproxy >/dev/null 2>&1; then
+    uci -q set space-link=tproxy 2>/dev/null || {
+      # space-link config-файла ещё нет — создаём пустой и секцию.
+      touch /etc/config/space-link 2>/dev/null || true
+      uci -q set space-link.tproxy=tproxy 2>/dev/null || true
+    }
+  fi
+  uci -q set space-link.tproxy.dns_tunnel="$DNS_TUNNEL" 2>/dev/null || true
+  uci -q set space-link.tproxy.block_quic="$BLOCK_QUIC" 2>/dev/null || true
+  uci -q commit space-link 2>/dev/null || true
+
   # 1) Убедимся что ядро умеет nft tproxy. Сначала пробуем modprobe, потом
   #    apk add нужных kmod-пакетов. Если ничего не помогло — выходим
   #    мягко, не валим всю установку.
@@ -630,6 +656,26 @@ configure_tproxy() {
   #    идемпотентности: если таблица есть, она пересоздаётся; если нет —
   #    delete молча игнорится благодаря объявлению на первой строке.
   mkdir -p /etc/space-link 2>/dev/null || true
+
+  # DNS-leak тумблер: когда dns_tunnel=1, перехватываем исходящий из LAN
+  # DNS (порт 53 tcp+udp) в tproxy ДО private-исключений — иначе запрос к
+  # dnsmasq/роутеру (192.168.x.1:53) вернулся бы по `return` и ушёл мимо
+  # туннеля. sing-box ловит его на tproxy-инбаунде и гонит через dns-out.
+  DNS_RULE_V4=""
+  DNS_RULE_V6=""
+  if [ "$DNS_TUNNEL" = "1" ]; then
+    DNS_RULE_V4="iifname \"br-lan\" meta l4proto { tcp, udp } th dport 53 tproxy ip to :__TPROXY_PORT__ meta mark set __TPROXY_MARK__ accept"
+    DNS_RULE_V6="iifname \"br-lan\" meta l4proto { tcp, udp } th dport 53 tproxy ip6 to :__TPROXY_PORT__ meta mark set __TPROXY_MARK__ accept"
+  fi
+
+  # QUIC тумблер: режем UDP/443 из LAN, чтобы браузеры откатились на TCP/TLS
+  # (HTTP/2), который tproxy уверенно sniff'ит. Иначе часть HTTP/3-трафика
+  # уходит по IP-маршрутизации мимо правил доменной маршрутизации.
+  QUIC_RULE=""
+  if [ "$BLOCK_QUIC" = "1" ]; then
+    QUIC_RULE="iifname \"br-lan\" meta l4proto udp th dport 443 reject"
+  fi
+
   cat > /etc/space-link/tproxy.nft <<NFT
 table inet space_link
 delete table inet space_link
@@ -638,18 +684,42 @@ table inet space_link {
     chain prerouting {
         type filter hook prerouting priority mangle; policy accept;
 
+        # IPv4 private / special-use исключения — этот трафик НЕ заворачиваем.
         ip daddr 0.0.0.0/8        return
         ip daddr 10.0.0.0/8       return
         ip daddr 127.0.0.0/8      return
         ip daddr 169.254.0.0/16   return
         ip daddr 172.16.0.0/12    return
         ip daddr 192.168.0.0/16   return
+        ip daddr 100.64.0.0/10    return
         ip daddr 224.0.0.0/4      return
         ip daddr 240.0.0.0/4      return
         ip daddr 255.255.255.255  return
+
+        # IPv6 private / special-use исключения (симметрично IPv4) — закрывает
+        # v6-leak: без них ip6 daddr-трафик из LAN не имел бы private-returns и
+        # ловился бы (или утекал в зависимости от ip6 rule). LAN/ULA/link-local
+        # и multicast остаются локальными.
+        ip6 daddr ::1/128         return
+        ip6 daddr ::/128          return
+        ip6 daddr fe80::/10       return
+        ip6 daddr fc00::/7        return
+        ip6 daddr ff00::/8        return
+        ip6 daddr ::ffff:0:0/96   return
+
         fib daddr type local      return
 
-        iifname "br-lan" meta l4proto { tcp, udp } tproxy ip to :__TPROXY_PORT__ meta mark set __TPROXY_MARK__ accept
+        # DNS-tunnel (по тумблеру dns_tunnel): перехват 53 ДО общего правила.
+        ${DNS_RULE_V4}
+        ${DNS_RULE_V6}
+
+        # QUIC-block (по тумблеру block_quic): режем UDP/443 → TCP-fallback.
+        ${QUIC_RULE}
+
+        # Основной заворот: TCP+UDP из LAN на tproxy-инбаунд sing-box.
+        # Парные правила для IPv4 и IPv6 (`tproxy ip` / `tproxy ip6`).
+        iifname "br-lan" meta l4proto { tcp, udp } meta nfproto ipv4 tproxy ip to :__TPROXY_PORT__ meta mark set __TPROXY_MARK__ accept
+        iifname "br-lan" meta l4proto { tcp, udp } meta nfproto ipv6 tproxy ip6 to :__TPROXY_PORT__ meta mark set __TPROXY_MARK__ accept
     }
     # output chain убран в v0.2.3 — он содержал только returns без активной
     # маркировки, при этом регистрировался как второй mangle-hook на output
@@ -657,6 +727,8 @@ table inet space_link {
 }
 NFT
   sed -i "s/__TPROXY_PORT__/$TPROXY_PORT/g; s/__TPROXY_MARK__/$TPROXY_MARK/g" /etc/space-link/tproxy.nft
+  # Подчистить пустые строки от незаданных опциональных правил (косметика).
+  sed -i '/^        $/d' /etc/space-link/tproxy.nft
 
   # 5) init.d-скрипт. apply: грузит nft + ставит fwmark rule + local-route.
   #    stop: сносит таблицу и rule. reload == apply.
@@ -667,10 +739,17 @@ STOP=10
 
 apply() {
   nft -f /etc/space-link/tproxy.nft 2>&1 | logger -t space-link-tproxy
+  # IPv4 fwmark → отдельная таблица с local-route на lo (tproxy ловит на :port).
   ip rule del fwmark __MARK__ table __TABLE__ 2>/dev/null
   ip rule add fwmark __MARK__ table __TABLE__ 2>/dev/null
   ip route flush table __TABLE__ 2>/dev/null
   ip route add local 0.0.0.0/0 dev lo table __TABLE__ 2>/dev/null
+  # IPv6 симметрично — закрывает v6-leak (нужно вместе с ip6 daddr-исключениями
+  # и парным `tproxy ip6` правилом в nft). del перед add — идемпотентность.
+  ip -6 rule del fwmark __MARK__ table __TABLE__ 2>/dev/null
+  ip -6 rule add fwmark __MARK__ table __TABLE__ 2>/dev/null
+  ip -6 route flush table __TABLE__ 2>/dev/null
+  ip -6 route add local ::/0 dev lo table __TABLE__ 2>/dev/null
 }
 
 start() { apply; }
@@ -678,6 +757,8 @@ stop() {
   nft delete table inet space_link 2>/dev/null
   ip rule del fwmark __MARK__ table __TABLE__ 2>/dev/null
   ip route flush table __TABLE__ 2>/dev/null
+  ip -6 rule del fwmark __MARK__ table __TABLE__ 2>/dev/null
+  ip -6 route flush table __TABLE__ 2>/dev/null
 }
 reload() { apply; }
 INITD
@@ -704,7 +785,17 @@ HOOK
   # 9) Verify.
   sleep 1
   if nft list table inet space_link >/dev/null 2>&1; then
-    ok "TPROXY активен (table inet space_link загружена, port=$TPROXY_PORT, mark=$TPROXY_MARK, table=$TPROXY_TABLE)"
+    ok "TPROXY активен (table inet space_link, port=$TPROXY_PORT, mark=$TPROXY_MARK, table=$TPROXY_TABLE)"
+    # Диагностика двойного стека + тумблеров.
+    if ip -6 rule show 2>/dev/null | grep -q "fwmark $(printf '0x%x' "$TPROXY_MARK" 2>/dev/null || echo "$TPROXY_MARK")\|fwmark $TPROXY_MARK"; then
+      ok "  IPv6 fwmark-rule активен (v6-leak закрыт)"
+    else
+      warn "  IPv6 fwmark-rule не виден — на роутере без IPv6 это норма"
+    fi
+    [ "$DNS_TUNNEL" = "1" ] && ok "  DNS-tunnel: ВКЛ (весь :53 из LAN → туннель)" \
+                           || ok "  DNS-tunnel: ВЫКЛ (uci set space-link.tproxy.dns_tunnel=1)"
+    [ "$BLOCK_QUIC" = "1" ] && ok "  QUIC-block: ВКЛ (UDP/443 режется → TCP-fallback)" \
+                            || ok "  QUIC-block: ВЫКЛ (uci set space-link.tproxy.block_quic=1)"
   else
     warn "TPROXY не применился — посмотри: logread -t space-link-tproxy"
   fi
@@ -767,7 +858,14 @@ CAP
   fi
 
   # uci sing-box.main.enabled=1 — без этого init.d молча выходит из start_service.
-  uci -q set sing-box.main.enabled='1' && uci -q commit sing-box
+  uci -q set sing-box.main.enabled='1'
+  # conffile — КРИТИЧНО для кнопки «Перезапустить VPN» (RTR-5). Стоковый
+  # /etc/init.d/sing-box читает путь к конфигу из uci sing-box.main.conffile.
+  # Go API рендерит активный сервер в /etc/sing-box/config.json, поэтому init.d
+  # должен указывать ровно на этот файл — иначе рестарт грузит стаб/чужой конфиг
+  # и тоннель не поднимается. Должно совпадать с SINGBOX_CONFIG в api/config.go.
+  uci -q set sing-box.main.conffile='/etc/sing-box/config.json'
+  uci -q commit sing-box
 
   /etc/init.d/sing-box enable >/dev/null 2>&1 || true
   /etc/init.d/sing-box restart >/dev/null 2>&1 || /etc/init.d/sing-box start >/dev/null 2>&1 \
@@ -846,22 +944,23 @@ save_state() {
 
 # ---- dnsmasq alias ---------------------------------------------------------
 # Защищённая версия. Шаги:
-#   1) выгребаем все spacelink.lan-записи (uci del_list) и битые address'ы
+#   1) выгребаем все my.space-записи (uci del_list) и битые address'ы
 #      (sed по сырому /etc/config/dhcp — кавычки, лишние слэши).
-#   2) добавляем /spacelink.lan/$EFFECTIVE_BIND.
+#   2) добавляем /my.space/$EFFECTIVE_BIND.
 #   3) commit + restart + sleep 2 + verify (pgrep dnsmasq && nslookup gitlab.com).
 #   4) если verify провалился — откат через rollback_uci (наш свежий снапшот),
 #      затем /rom/etc/config/dhcp как последний резерв. После каждого отката
-#      делаем ещё одну попытку добавить spacelink.lan.
+#      делаем ещё одну попытку добавить my.space.
 configure_dns() {
-  step "Регистрация spacelink.lan → $EFFECTIVE_BIND в dnsmasq"
+  step "Регистрация my.space → $EFFECTIVE_BIND в dnsmasq"
 
   if ! command -v uci >/dev/null 2>&1; then
     if [ -f /etc/dnsmasq.conf ]; then
       sed -i "/my\\.spacelink/d" /etc/dnsmasq.conf 2>/dev/null || true
-      printf 'address=/spacelink.lan/%s\n' "$EFFECTIVE_BIND" >> /etc/dnsmasq.conf
+      sed -i "/spacelink\\.lan/d" /etc/dnsmasq.conf 2>/dev/null || true
+      printf 'address=/my.space/%s\n' "$EFFECTIVE_BIND" >> /etc/dnsmasq.conf
       /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
-      ok "spacelink.lan → $EFFECTIVE_BIND (через dnsmasq.conf)"
+      ok "my.space → $EFFECTIVE_BIND (через dnsmasq.conf)"
     else
       warn "ни uci, ни dnsmasq.conf не доступны — открывай панель по IP: http://$EFFECTIVE_BIND"
     fi
@@ -870,13 +969,13 @@ configure_dns() {
 
   _dns_uci_purge_all
   _dns_sed_scrub
-  uci -q add_list dhcp.@dnsmasq[0].address="/spacelink.lan/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
+  uci -q add_list dhcp.@dnsmasq[0].address="/my.space/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
   uci -q commit dhcp >/dev/null 2>&1 || true
   /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
   sleep 2
 
   if _dns_verify; then
-    ok "spacelink.lan → $EFFECTIVE_BIND (dnsmasq жив, DNS отвечает)"
+    ok "my.space → $EFFECTIVE_BIND (dnsmasq жив, DNS отвечает)"
     return 0
   fi
 
@@ -897,18 +996,18 @@ configure_dns() {
   fi
 
   if _dns_verify; then
-    # Базу подняли. Аккуратно докинем spacelink.lan ещё раз.
-    uci -q add_list dhcp.@dnsmasq[0].address="/spacelink.lan/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
+    # Базу подняли. Аккуратно докинем my.space ещё раз.
+    uci -q add_list dhcp.@dnsmasq[0].address="/my.space/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
     uci -q commit dhcp >/dev/null 2>&1 || true
     /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
     sleep 2
     if _dns_verify; then
-      ok "dnsmasq восстановлен, spacelink.lan → $EFFECTIVE_BIND"
+      ok "dnsmasq восстановлен, my.space → $EFFECTIVE_BIND"
     else
-      # Снова легло именно от нашей записи. Лучше потерять spacelink.lan
+      # Снова легло именно от нашей записи. Лучше потерять my.space
       # чем DHCP/DNS клиентам.
-      warn "spacelink.lan ломает dnsmasq — оставляю без alias, открывай по IP: http://$EFFECTIVE_BIND"
-      uci -q del_list dhcp.@dnsmasq[0].address="/spacelink.lan/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
+      warn "my.space ломает dnsmasq — оставляю без alias, открывай по IP: http://$EFFECTIVE_BIND"
+      uci -q del_list dhcp.@dnsmasq[0].address="/my.space/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
       uci -q commit dhcp >/dev/null 2>&1 || true
       /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
     fi
@@ -922,6 +1021,8 @@ configure_dns() {
 _dns_uci_purge_all() {
   for ip in 192.168.1.1 192.168.1.2 192.168.1.3 192.168.1.100 192.168.1.101 192.168.0.1 "$ROUTER_IP" "$EFFECTIVE_BIND"; do
     [ -n "$ip" ] || continue
+    uci -q del_list dhcp.@dnsmasq[0].address="/my.space/$ip" >/dev/null 2>&1 || true
+    # legacy: spacelink.lan — канонический хост до v0.2.8, заменён на my.space.
     uci -q del_list dhcp.@dnsmasq[0].address="/spacelink.lan/$ip" >/dev/null 2>&1 || true
     # legacy: my.spacelink — браузеры (особенно мобильный Safari) не
     # распознавали как URL, удаляем при первом же апгрейде до v0.2.6+.
@@ -932,7 +1033,7 @@ _dns_uci_purge_all() {
   if [ -n "$addrs" ]; then
     for a in $addrs; do
       case "$a" in
-        */spacelink.lan/*|*/my.spacelink/*)
+        */my.space/*|*/spacelink.lan/*|*/my.spacelink/*)
           uci -q del_list dhcp.@dnsmasq[0].address="$a" >/dev/null 2>&1 || true
           ;;
       esac
@@ -942,12 +1043,15 @@ _dns_uci_purge_all() {
 
 # Sed по сырому /etc/config/dhcp. Снимает строки, в которых list address
 # содержит обратный слэш (типовой признак побитого экранирования) или
-# подстроку spacelink.lan (если uci по какой-то причине промахнулся).
+# подстроку любого из наших доменов (если uci по какой-то причине промахнулся):
+# my.space (текущий), spacelink.lan и my.spacelink (legacy).
 _dns_sed_scrub() {
   [ -f /etc/config/dhcp ] || return 0
   cp /etc/config/dhcp "$BACKUP_DIR/dhcp.preinstall.$(date +%s 2>/dev/null || echo x)" 2>/dev/null || true
   # BusyBox sed: \{1,\} не поддерживается, используем простые паттерны.
   sed -i '/list address.*\\/d' /etc/config/dhcp 2>/dev/null || true
+  sed -i '/list address.*my\.space\//d' /etc/config/dhcp 2>/dev/null || true
+  sed -i '/list address.*spacelink\.lan/d' /etc/config/dhcp 2>/dev/null || true
   sed -i '/list address.*my\.spacelink/d' /etc/config/dhcp 2>/dev/null || true
 }
 
@@ -989,7 +1093,7 @@ final_summary() {
   printf '   Space Link Router установлен (%s)\n' "$VERSION"
   printf '%s\n' "================================================"
   printf '   WiFi:       %s\n' "$wifi"
-  printf '   Панель:     http://spacelink.lan%s   (или %s)\n' "$port_suffix" "$panel_url"
+  printf '   Панель:     http://my.space%s   (или %s)\n' "$port_suffix" "$panel_url"
   if [ "$EFFECTIVE_BIND" = "$router_ip" ]; then
     printf '   LuCI:       выключена (мы заняли :80 на основном IP)\n'
   else
@@ -1047,21 +1151,34 @@ final_summary() {
   fi
 
   if command -v nslookup >/dev/null 2>&1 && \
-     nslookup spacelink.lan 127.0.0.1 2>/dev/null | grep -q "$EFFECTIVE_BIND"; then
-    printf '   spacelink.lan:    OK  резолвит в %s\n' "$EFFECTIVE_BIND"
+     nslookup my.space 127.0.0.1 2>/dev/null | grep -q "$EFFECTIVE_BIND"; then
+    printf '   my.space:        OK  резолвит в %s\n' "$EFFECTIVE_BIND"
   else
-    printf '   spacelink.lan:    --  не резолвит — открывай по %s\n' "$panel_url"
+    printf '   my.space:        --  не резолвит — открывай по %s\n' "$panel_url"
   fi
 
   if command -v nft >/dev/null 2>&1 && nft list table inet space_link >/dev/null 2>&1; then
-    printf '   TPROXY:          OK  nft table space_link загружена\n'
+    dnst=$(uci -q get space-link.tproxy.dns_tunnel 2>/dev/null || echo 0)
+    quic=$(uci -q get space-link.tproxy.block_quic 2>/dev/null || echo 0)
+    dns_lbl="выкл"; [ "$dnst" = "1" ] && dns_lbl="вкл"
+    quic_lbl="выкл"; [ "$quic" = "1" ] && quic_lbl="вкл"
+    printf '   TPROXY:          OK  nft table space_link (v4+v6, DNS-tunnel:%s, QUIC-block:%s)\n' "$dns_lbl" "$quic_lbl"
   else
     printf '   TPROXY:          ERR таблица не загружена — посмотри: logread -t space-link-tproxy\n'
   fi
 
+  # conffile-проверка (RTR-5): кнопка «Перезапустить VPN» из панели грузит
+  # config.json только если стоковый init.d указывает на него через uci.
+  cf=$(uci -q get sing-box.main.conffile 2>/dev/null || echo "")
+  if [ "$cf" = "/etc/sing-box/config.json" ]; then
+    printf '   sing-box conffile: OK  %s (рестарт из панели грузит активный конфиг)\n' "$cf"
+  else
+    printf '   sing-box conffile: ERR %s — кнопка рестарта может грузить не тот конфиг\n' "${cf:-не задан}"
+  fi
+
   printf '\n'
   if [ "$dns_ok" = "1" ] && [ "$api_ok" = "1" ] && [ "$http_ok" = "1" ]; then
-    printf '   Установка успешна. Открывай: http://spacelink.lan%s\n' "$port_suffix"
+    printf '   Установка успешна. Открывай: http://my.space%s\n' "$port_suffix"
   else
     printf '   Установка завершена с предупреждениями. Запусти %s ещё раз — установщик попробует починить.\n' "$0"
   fi

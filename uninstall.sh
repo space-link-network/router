@@ -46,6 +46,12 @@ rm -f /etc/nftables.d/99-space-link-tproxy.nft 2>/dev/null || true
 ip rule del fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" 2>/dev/null || true
 ip -6 rule del fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" 2>/dev/null || true
 ip route flush table "$TPROXY_TABLE" 2>/dev/null || true
+ip -6 route flush table "$TPROXY_TABLE" 2>/dev/null || true
+# anti-leak тумблеры жили в uci-конфиге space-link (v0.3.0) — снимаем секцию.
+if command -v uci >/dev/null 2>&1; then
+  uci -q delete space-link.tproxy >/dev/null 2>&1 || true
+  uci -q commit space-link >/dev/null 2>&1 || true
+fi
 if command -v nft >/dev/null 2>&1; then
   nft delete table inet space_link >/dev/null 2>&1 || true
 fi
@@ -62,7 +68,7 @@ if command -v uci >/dev/null 2>&1; then
   if [ -n "$addrs" ]; then
     for a in $addrs; do
       case "$a" in
-        */my.spacelink/*|*/spacelink.lan/*)
+        */my.space/*|*/my.spacelink/*|*/spacelink.lan/*)
           uci -q del_list dhcp.@dnsmasq[0].address="$a" >/dev/null 2>&1 || true
           ;;
       esac
@@ -71,6 +77,7 @@ if command -v uci >/dev/null 2>&1; then
   fi
 fi
 if [ -f /etc/dnsmasq.conf ]; then
+  sed -i '/^address=\/my\.space\//d' /etc/dnsmasq.conf 2>/dev/null || true
   sed -i '/^address=\/my\.spacelink\//d' /etc/dnsmasq.conf 2>/dev/null || true
   sed -i '/^address=\/spacelink\.lan\//d' /etc/dnsmasq.conf 2>/dev/null || true
 fi
