@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.0"
+VERSION="0.3.2"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -435,7 +435,7 @@ install_rules() {
   if [ -d "$SCRIPT_DIR/../rules/presets" ]; then
     cp "$SCRIPT_DIR/../rules/presets"/*.txt "$RULES_DIR/presets/" 2>/dev/null || true
   else
-    for preset in ru cis ai social; do
+    for preset in ru cis ai social stores crypto ads twitch-ads win-spy torrent; do
       fetch "$RELEASE_BASE/rules-$preset.txt" "$RULES_DIR/presets/$preset.txt" 2>/dev/null \
         || warn "пресет $preset не скачался — не критично, можно выбрать позже"
     done
@@ -582,18 +582,17 @@ configure_tproxy() {
   TPROXY_MARK="${TPROXY_MARK:-255}"
   TPROXY_TABLE="${TPROXY_TABLE:-100}"
 
-  # Anti-leak тумблеры (по умолчанию ВЫКЛ, чтобы не ломать домашние сети).
+  # Anti-leak тумблеры.
   #   dns_tunnel  — весь DNS через туннель.
   #   block_quic  — режем UDP/443 (QUIC) из LAN → браузеры откатываются на
-  #                 TCP/TLS. ОБЫЧНО НЕ НУЖНО: sing-box-outbound теперь шлёт
-  #                 packet_encoding=xudp, поэтому UDP/QUIC корректно идёт через
-  #                 VLESS (как на телефоне в Happ). block_quic=1 оставлен как
-  #                 страховка, если на конкретном сервере QUIC всё же глючит —
-  #                 тогда трафик гарантированно уходит по TCP.
-  # Переопределяется: uci set space-link.tproxy.block_quic=1; commit; reload —
+  #                 TCP/TLS. В transparent-router режиме это стабильнее для
+  #                 HTTP/3-сайтов вроде Proton Mail: браузер не зависает на
+  #                 UDP-сессии, а открывает тот же домен через TCP, который
+  #                 sing-box уверенно sniff'ит и туннелирует.
+  # Переопределяется: uci set space-link.tproxy.block_quic=0; commit; reload —
   # или из окружения TPROXY_DNS_TUNNEL / TPROXY_BLOCK_QUIC при установке.
   DNS_TUNNEL="${TPROXY_DNS_TUNNEL:-$(uci -q get space-link.tproxy.dns_tunnel 2>/dev/null || echo 0)}"
-  BLOCK_QUIC="${TPROXY_BLOCK_QUIC:-$(uci -q get space-link.tproxy.block_quic 2>/dev/null || echo 0)}"
+  BLOCK_QUIC="${TPROXY_BLOCK_QUIC:-$(uci -q get space-link.tproxy.block_quic 2>/dev/null || echo 1)}"
 
   # Зафиксируем дефолты в uci, чтобы UI/CLI могли их читать и переключать.
   if ! uci -q get space-link.tproxy >/dev/null 2>&1; then
@@ -794,8 +793,8 @@ HOOK
     fi
     [ "$DNS_TUNNEL" = "1" ] && ok "  DNS-tunnel: ВКЛ (весь :53 из LAN → туннель)" \
                            || ok "  DNS-tunnel: ВЫКЛ (uci set space-link.tproxy.dns_tunnel=1)"
-    [ "$BLOCK_QUIC" = "1" ] && ok "  QUIC-block: ВКЛ (UDP/443 режется → TCP-fallback)" \
-                            || ok "  QUIC-block: ВЫКЛ (uci set space-link.tproxy.block_quic=1)"
+    [ "$BLOCK_QUIC" = "1" ] && ok "  QUIC-block: ВКЛ (UDP/443 режется → TCP-fallback; выключить: uci set space-link.tproxy.block_quic=0)" \
+                            || ok "  QUIC-block: ВЫКЛ (включить: uci set space-link.tproxy.block_quic=1)"
   else
     warn "TPROXY не применился — посмотри: logread -t space-link-tproxy"
   fi
