@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.5"
+VERSION="0.3.6"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -1088,6 +1088,18 @@ http_ok() {
   wget -q --timeout=3 -O- "$url" >/dev/null 2>&1
 }
 
+panel_ok() {
+  url="$1"
+  host="$2"
+  http_ok "$url" && return 0
+  http_ok "http://my.space/" && return 0
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS -m 3 -H "Host: $host" "$url" >/dev/null 2>&1
+    return $?
+  fi
+  return 1
+}
+
 restart_service() {
   svc="$1"
   reason="$2"
@@ -1114,14 +1126,14 @@ panel_url="http://$bind:$port/"
 if ! pgrep -x lighttpd >/dev/null 2>&1; then
   restart_service lighttpd "process not running"
   sleep 2
-elif ! http_ok "$panel_url"; then
+elif ! panel_ok "$panel_url" "my.space"; then
   restart_service lighttpd "panel http check failed ($panel_url)"
   sleep 2
 fi
 
 if ! pgrep -x lighttpd >/dev/null 2>&1; then
   log "lighttpd still not running after restart"
-elif ! http_ok "$panel_url"; then
+elif ! panel_ok "$panel_url" "my.space"; then
   log "panel still not reachable after lighttpd restart ($panel_url)"
 fi
 WATCHDOG
