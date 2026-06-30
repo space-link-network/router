@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.4"
+VERSION="0.3.5"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -1067,12 +1067,75 @@ _dns_verify() {
   return 0
 }
 
+# ---- panel watchdog --------------------------------------------------------
+install_panel_watchdog() {
+  step "Установка watchdog панели"
+  cat > /usr/bin/space-link-panel-watchdog <<'WATCHDOG'
+#!/bin/sh
+# Self-heal for the local router panel. VPN data-plane may be fine while the
+# panel is down: API can die, or lighttpd can stop serving/proxying after boot.
+
+log() {
+  logger -t space-link-panel-watchdog "$*" 2>/dev/null || echo "space-link-panel-watchdog: $*"
+}
+
+http_ok() {
+  url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS -m 3 "$url" >/dev/null 2>&1
+    return $?
+  fi
+  wget -q --timeout=3 -O- "$url" >/dev/null 2>&1
+}
+
+restart_service() {
+  svc="$1"
+  reason="$2"
+  log "$svc unhealthy: $reason; restarting"
+  /etc/init.d/"$svc" enable >/dev/null 2>&1 || true
+  /etc/init.d/"$svc" restart >/dev/null 2>&1 || /etc/init.d/"$svc" start >/dev/null 2>&1 || true
+}
+
+api_url="http://127.0.0.1:8080/api/local/health"
+if ! http_ok "$api_url"; then
+  restart_service space-link "api health failed"
+  sleep 3
+  http_ok "$api_url" || log "space-link-api still unhealthy after restart"
+fi
+
+conf="/etc/lighttpd/conf.d/space-link.conf"
+bind="$(awk -F'"' '/server.bind/ { print $2; exit }' "$conf" 2>/dev/null)"
+port="$(awk '/server.port/ { print $3; exit }' "$conf" 2>/dev/null)"
+[ -n "$bind" ] || bind="$(uci -q get network.lan.ipaddr 2>/dev/null || echo 192.168.1.1)"
+[ -n "$port" ] || port="80"
+panel_url="http://$bind:$port/"
+[ "$port" = "80" ] && panel_url="http://$bind/"
+
+if ! pgrep -x lighttpd >/dev/null 2>&1; then
+  restart_service lighttpd "process not running"
+  sleep 2
+elif ! http_ok "$panel_url"; then
+  restart_service lighttpd "panel http check failed ($panel_url)"
+  sleep 2
+fi
+
+if ! pgrep -x lighttpd >/dev/null 2>&1; then
+  log "lighttpd still not running after restart"
+elif ! http_ok "$panel_url"; then
+  log "panel still not reachable after lighttpd restart ($panel_url)"
+fi
+WATCHDOG
+  chmod 0755 /usr/bin/space-link-panel-watchdog
+  ok "panel watchdog"
+}
+
 # ---- heartbeat cron --------------------------------------------------------
 install_cron() {
-  step "Установка cron для heartbeat"
-  cron_line="*/5 * * * * /usr/bin/wget -q -O- http://127.0.0.1:8080/api/local/status >/dev/null 2>&1"
+  step "Установка cron для heartbeat/watchdog"
+  heartbeat_line="*/5 * * * * /usr/bin/wget -q -O- http://127.0.0.1:8080/api/local/status >/dev/null 2>&1 # space-link-heartbeat"
+  watchdog_line="* * * * * /usr/bin/space-link-panel-watchdog >/dev/null 2>&1 # space-link-panel-watchdog"
   if command -v crontab >/dev/null 2>&1; then
-    (crontab -l 2>/dev/null | grep -v 'space-link' ; printf '%s # space-link\n' "$cron_line") | crontab -
+    (crontab -l 2>/dev/null | grep -v 'space-link' ; printf '%s\n%s\n' "$heartbeat_line" "$watchdog_line") | crontab -
     /etc/init.d/cron restart >/dev/null 2>&1 || true
     ok "cron"
   else
@@ -1206,5 +1269,6 @@ save_state
 configure_dns
 configure_tproxy
 enable_services
+install_panel_watchdog
 install_cron
 final_summary
