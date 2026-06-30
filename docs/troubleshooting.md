@@ -95,7 +95,6 @@ wget -qO- https://install.space-link.app/uninstall.sh | sh -s -- --purge
 ## Куда писать, если ничего не помогает
 
 - Telegram: [@spacelink_support](https://t.me/spacelink_support)
-- Issues: [gitlab.com/space-link-vpn/router/-/issues](https://gitlab.com/space-link-vpn/router/-/issues)
 
 В обращении укажите модель роутера, версию OpenWrt (`cat /etc/openwrt_release`) и
 вывод:

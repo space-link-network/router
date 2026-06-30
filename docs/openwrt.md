@@ -121,12 +121,11 @@ Image** и выберите `openwrt-mediatek-filogic-netis_nx31-squashfs-sysupg
 скачает и настроит всё необходимое:
 
 ```sh
-wget -qO- https://install.space-link.app/install.sh | sh -s -- --token <ВАШ_ТОКЕН>
+wget -qO- https://install.space-link.app/install.sh | sh
 ```
 
-Без `--token` установщик спросит токен — вставьте его вручную (или нажмите Enter и
-введите позже через панель). Токен берётся в личном кабинете
-[app.space-link.app](https://app.space-link.app/routers), раздел «Роутеры».
+В процессе установки введите токен — установщик сам его спросит. Токен берётся в
+личном кабинете [space-link.app](https://space-link.app/routers), раздел «Роутеры».
 
 Дождитесь финального блока «Диагностика» — там же будет напечатан адрес панели.
 
