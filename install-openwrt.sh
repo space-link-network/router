@@ -583,15 +583,19 @@ configure_tproxy() {
   TPROXY_TABLE="${TPROXY_TABLE:-100}"
 
   # Anti-leak тумблеры.
-  #   dns_tunnel  — весь DNS через туннель.
+  #   dns_tunnel  — весь DNS из LAN через туннель. Дефолт ВКЛ (v0.3.9): без
+  #                 него роутер резолвит открытым :53 по РФ-каналу, где ТСПУ
+  #                 ломает DNS заблокированных доменов (proton.me → SERVFAIL) —
+  #                 сайт не открывается даже при живом туннеле. Для VPN-роутера
+  #                 это единственно верный дефолт.
   #   block_quic  — режем UDP/443 (QUIC) из LAN → браузеры откатываются на
   #                 TCP/TLS. В transparent-router режиме это стабильнее для
   #                 HTTP/3-сайтов вроде Proton Mail: браузер не зависает на
   #                 UDP-сессии, а открывает тот же домен через TCP, который
   #                 sing-box уверенно sniff'ит и туннелирует.
-  # Переопределяется: uci set space-link.tproxy.block_quic=0; commit; reload —
+  # Переопределяется: uci set space-link.tproxy.dns_tunnel=0; commit; reload —
   # или из окружения TPROXY_DNS_TUNNEL / TPROXY_BLOCK_QUIC при установке.
-  DNS_TUNNEL="${TPROXY_DNS_TUNNEL:-$(uci -q get space-link.tproxy.dns_tunnel 2>/dev/null || echo 0)}"
+  DNS_TUNNEL="${TPROXY_DNS_TUNNEL:-$(uci -q get space-link.tproxy.dns_tunnel 2>/dev/null || echo 1)}"
   BLOCK_QUIC="${TPROXY_BLOCK_QUIC:-$(uci -q get space-link.tproxy.block_quic 2>/dev/null || echo 1)}"
 
   # Зафиксируем дефолты в uci, чтобы UI/CLI могли их читать и переключать.
