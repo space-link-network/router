@@ -27,8 +27,13 @@ EFFECTIVE_BIND="$PANEL_IP"
 EFFECTIVE_PORT="$PANEL_PORT"
 ROUTER_IP=""
 
-# Packages we hard-require: install must abort if any is missing.
-REQUIRED_PKGS="ca-certificates curl sing-box lighttpd lighttpd-mod-proxy lighttpd-mod-rewrite lighttpd-mod-redirect"
+# Пакеты, критичные для ПАНЕЛИ/ДОМЕНА — установка прерывается, если чего-то нет.
+# sing-box (VPN-движок) СОЗНАТЕЛЬНО не здесь: его отсутствие не должно мешать
+# подняться панели и my.space (см. цикл движка в install_packages).
+REQUIRED_PKGS="ca-certificates curl lighttpd lighttpd-mod-proxy lighttpd-mod-rewrite lighttpd-mod-redirect"
+# VPN-движок — best-effort: если недоступен в фиде, WARN и продолжаем, чтобы
+# панель/домен всё равно поднялись; движок можно доустановить позже.
+ENGINE_PKGS="sing-box"
 # Optional pkgs — install if available, warn-only on failure.
 OPTIONAL_PKGS="kmod-tun"
 
@@ -265,7 +270,7 @@ preflight() {
 ensure_dns() {
   # Если dnsmasq отвечает на 127.0.0.1:53 — всё хорошо.
   if command -v nslookup >/dev/null 2>&1; then
-    if nslookup gitlab.com 127.0.0.1 >/dev/null 2>&1; then
+    if nslookup localhost 127.0.0.1 >/dev/null 2>&1; then
       ok "DNS (через dnsmasq)"
       return 0
     fi
@@ -388,6 +393,19 @@ install_packages() {
   if [ -n "$missing" ]; then
     die "Не удалось установить обязательные пакеты:$missing. Проверь интернет/репозитории и повтори."
   fi
+
+  # VPN-движок (sing-box): best-effort. Панель и домен обязаны подняться даже
+  # если движок недоступен в фиде — иначе одна проблема с пакетом валит всю
+  # установку ещё ДО настройки my.space/панели.
+  for pkg in $ENGINE_PKGS; do
+    if pkg_is_installed "$pkg"; then
+      ok "$pkg (движок, уже стоит)"
+    elif pkg_install_one "$pkg"; then
+      ok "$pkg (движок)"
+    else
+      warn "движок $pkg не установился — панель и домен поднимутся, но VPN не заработает, пока не поставишь его вручную: apk add $pkg (или opkg install $pkg)"
+    fi
+  done
 
   for pkg in $OPTIONAL_PKGS; do
     if pkg_is_installed "$pkg"; then
@@ -1062,10 +1080,10 @@ _dns_sed_scrub() {
 _dns_verify() {
   pgrep dnsmasq >/dev/null 2>&1 || return 1
   if command -v nslookup >/dev/null 2>&1; then
-    nslookup gitlab.com 127.0.0.1 >/dev/null 2>&1 && return 0
-    # Бывает что gitlab.com не резолвится по причине внешнего блока — тогда
-    # запасной таргет, который точно резолвится через root-серверы.
-    nslookup openwrt.org 127.0.0.1 >/dev/null 2>&1 && return 0
+    # Резолвим ЛОКАЛЬНОЕ имя (localhost из /etc/hosts) — не зависим от внешней
+    # доступности: в РФ при блокировках gitlab/openwrt не резолвятся, и честно
+    # живой dnsmasq ложно признавался «сломанным».
+    nslookup localhost 127.0.0.1 >/dev/null 2>&1 && return 0
   fi
   # Без nslookup доверяем pgrep — это всё ещё лучше, чем ничего.
   return 0
