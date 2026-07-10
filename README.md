@@ -17,7 +17,7 @@
 Зайдите на роутер по SSH и выполните команду:
 
 ```sh
-wget -qO- https://install.space-link.app/install.sh | sh
+wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 ```
 
 Установщик сам всё скачает и настроит. В процессе он спросит токен — вставьте его.
@@ -49,7 +49,7 @@ wget -qO- https://install.space-link.app/install.sh | sh
 ## Обновление
 
 ```sh
-wget -qO- https://install.space-link.app/update.sh | sh
+wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/update.sh | sh
 ```
 
 Токен и настройки сохраняются.
@@ -57,13 +57,13 @@ wget -qO- https://install.space-link.app/update.sh | sh
 ## Удаление
 
 ```sh
-wget -qO- https://install.space-link.app/uninstall.sh | sh
+wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/uninstall.sh | sh
 ```
 
 Чтобы стереть всё, включая токен:
 
 ```sh
-wget -qO- https://install.space-link.app/uninstall.sh | sh -s -- --purge
+wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/uninstall.sh | sh -s -- --purge
 ```
 
 ---

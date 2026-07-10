@@ -11,7 +11,7 @@
 установки заработает через общий диспетчер:
 
 ```sh
-wget -qO- https://install.space-link.app/install.sh | sh
+wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 ```
 
 Диспетчер сам определит Keenetic и запустит соответствующий установщик.

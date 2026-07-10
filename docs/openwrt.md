@@ -121,7 +121,7 @@ Image** и выберите `openwrt-mediatek-filogic-netis_nx31-squashfs-sysupg
 скачает и настроит всё необходимое:
 
 ```sh
-wget -qO- https://install.space-link.app/install.sh | sh
+wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 ```
 
 В процессе установки введите токен — установщик сам его спросит. Токен берётся в

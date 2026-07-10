@@ -86,7 +86,7 @@ service uhttpd start
 ## Как полностью удалить
 
 ```sh
-wget -qO- https://install.space-link.app/uninstall.sh | sh -s -- --purge
+wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/uninstall.sh | sh -s -- --purge
 ```
 
 Флаг `--purge` удалит токен и состояние. Без него токен сохраняется для
