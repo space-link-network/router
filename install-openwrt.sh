@@ -1158,6 +1158,20 @@ if ! pgrep -x lighttpd >/dev/null 2>&1; then
 elif ! panel_ok "$panel_url" "my.space"; then
   log "panel still not reachable after lighttpd restart ($panel_url)"
 fi
+
+# my.space self-heal: если наш dnsmasq-алиас перестал резолвиться в панельный IP
+# (dnsmasq перезапустился с чистым конфигом / запись слетела) — переподнимаем.
+# Запрос локальный (127.0.0.1), не зависит от внешней сети/блокировок. Крон
+# гоняет этот скрипт раз в минуту, так что домен восстанавливается сам.
+if command -v uci >/dev/null 2>&1 && command -v nslookup >/dev/null 2>&1; then
+  if ! nslookup my.space 127.0.0.1 2>/dev/null | grep -q "$bind"; then
+    log "my.space не резолвит в $bind — переподнимаю dnsmasq-алиас"
+    uci -q del_list dhcp.@dnsmasq[0].address="/my.space/$bind" >/dev/null 2>&1 || true
+    uci -q add_list dhcp.@dnsmasq[0].address="/my.space/$bind" >/dev/null 2>&1 || true
+    uci -q commit dhcp >/dev/null 2>&1 || true
+    /etc/init.d/dnsmasq reload >/dev/null 2>&1 || /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+  fi
+fi
 WATCHDOG
   chmod 0755 /usr/bin/space-link-panel-watchdog
   ok "panel watchdog"
