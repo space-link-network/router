@@ -14,6 +14,8 @@
 
 ## Часть 1. Прошивка OpenWrt
 
+> ⚠️ **Про имена файлов — важно.** Все имена файлов в командах ниже даны **для примера (Netis NX32U)**. У каждой модели роутера имена свои — у NX31, NX32U и других они **отличаются**. Везде, где встречается имя файла, подставляйте имя файла **именно вашей модели** (то, что вы скачали с firmware-selector для своего роутера). Ошибётесь с именем — загрузчик не заберёт файл и прошивка не встанет.
+
 ### Шаг 1. Скачайте всё необходимое
 
 Понадобятся три файла прошивки и три программы.
@@ -24,8 +26,8 @@ Installation):
 
 1. **Factory image** последней версии OpenWrt.
 2. **Sysupgrade image** (оттуда же).
-3. **Файл uboot** (`netis_nx31-bl31-uboot.fip`) последней стабильной версии: на
-   firmware-selector выберите релиз → Mediatek → Filogic → нужный файл.
+3. **Файл uboot** (пример для NX32U: `netis_nx32u-bl31-uboot.fip` — ⚠️ у вашей модели имя другое!) последней стабильной версии: на
+   firmware-selector выберите релиз → Mediatek → Filogic → нужный файл вашей модели.
 
 Программы:
 
@@ -39,11 +41,11 @@ Installation):
 их по TFTP, и команды ниже придётся править под себя.
 
 ```
-Было:   openwrt-24.10.1-mediatek-filogic-netis_nx31-bl31-uboot.fip
-Стало:  openwrt-mediatek-filogic-netis_nx31-bl31-uboot.fip
+Было:   openwrt-24.10.1-mediatek-filogic-netis_nx32u-bl31-uboot.fip
+Стало:  openwrt-mediatek-filogic-netis_nx32u-bl31-uboot.fip
 ```
 
-То же самое сделайте для initramfs-recovery и sysupgrade файлов.
+То же самое сделайте для initramfs-recovery и sysupgrade файлов. Помните: `nx32u` в примерах — это пример; вместо него везде подставляйте обозначение **вашей** модели.
 
 ### Шаг 3. Подключитесь к роутеру по LAN
 
@@ -59,7 +61,7 @@ Installation):
 
 Запустите WinSCP и подключитесь к роутеру по адресу `192.168.1.1` (логин и пароль
 — стандартные для веб-интерфейса). Создайте в корне файловой системы папку `tmp`
-и скопируйте в `/tmp` файл `openwrt-mediatek-filogic-netis_nx31-bl31-uboot.fip`.
+и скопируйте в `/tmp` файл `openwrt-mediatek-filogic-netis_nx32u-bl31-uboot.fip` (⚠️ подставьте имя файла вашей модели вместо `nx32u`).
 Закройте WinSCP.
 
 ### Шаг 6. Запишите uboot по SSH
@@ -67,16 +69,18 @@ Installation):
 Подключитесь к роутеру по SSH (PuTTY, адрес `192.168.1.1`) и запишите загрузчик:
 
 ```sh
-mtd write /tmp/openwrt-mediatek-filogic-netis_nx31-bl31-uboot.fip FIP
+mtd write /tmp/openwrt-mediatek-filogic-netis_nx32u-bl31-uboot.fip FIP
 ```
+
+> ⚠️ Замените `openwrt-mediatek-filogic-netis_nx32u-bl31-uboot.fip` на имя файла **вашей** модели — то самое, что вы скопировали в `/tmp` на шаге 5. Имя должно совпадать точно.
 
 ### Шаг 7. Настройте Tftpd64
 
 Запустите Tftpd64:
 
 - **Current Dir** — папка с файлами прошивки OpenWrt. В ней должен лежать
-  `openwrt-mediatek-filogic-netis_nx31-initramfs-recovery.itb` (имя строго такое,
-  иначе загрузчик его не заберёт).
+  `openwrt-mediatek-filogic-netis_nx32u-initramfs-recovery.itb` (⚠️ имя строго для вашей
+  модели: для NX32U — такое, для другой модели своё; иначе загрузчик его не заберёт).
 - **Server interface** — `192.168.1.254`.
 
 Остальное не трогайте.
@@ -102,7 +106,7 @@ Tftpd64: Server interface всегда должен быть `192.168.1.254`. К
 ### Шаг 10. Прошейте sysupgrade
 
 В LuCI: **System → Backup / Flash Firmware → Flash New Firmware Image → Flash
-Image** и выберите `openwrt-mediatek-filogic-netis_nx31-squashfs-sysupgrade.itb`.
+Image** и выберите `openwrt-mediatek-filogic-netis_nx32u-squashfs-sysupgrade.itb` (⚠️ подставьте файл вашей модели вместо `nx32u`).
 Нажмите **Upload**, затем **Continue**. Дождитесь полной прошивки и снова
 откройте веб-интерфейс.
 
