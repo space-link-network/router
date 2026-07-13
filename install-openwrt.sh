@@ -536,6 +536,18 @@ configure_panel_ip() {
   ip addr show br-lan 2>/dev/null | grep -q "inet $ROUTER_IP/" && main_present=1
   ip addr show br-lan 2>/dev/null | grep -q "inet $PANEL_IP/" && alias_present=1
 
+  # Подстраховка: если reload не поднял secondary-IP (частая причина «сайт/домен
+  # не открывается на первой установке» — на интерфейсе оказался один адрес
+  # вместо двух) — добавляем его напрямую. ip addr add НЕ рвёт соединение (в
+  # отличие от полного restart сети, что убило бы SSH-сессию установки), а
+  # uci-конфиг с двумя ipaddr уже закоммичен выше, так что адрес переживёт reboot.
+  if [ "$alias_present" != "1" ]; then
+    ip addr add "$PANEL_IP/24" dev br-lan 2>/dev/null || true
+    sleep 1
+    ip addr show br-lan 2>/dev/null | grep -q "inet $PANEL_IP/" && alias_present=1
+    ip addr show br-lan 2>/dev/null | grep -q "inet $ROUTER_IP/" && main_present=1
+  fi
+
   if [ "$main_present" = "1" ] && [ "$alias_present" = "1" ]; then
     EFFECTIVE_BIND="$PANEL_IP"
     EFFECTIVE_PORT="$PANEL_PORT"
