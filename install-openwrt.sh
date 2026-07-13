@@ -1184,6 +1184,18 @@ if command -v uci >/dev/null 2>&1 && command -v nslookup >/dev/null 2>&1; then
     /etc/init.d/dnsmasq reload >/dev/null 2>&1 || /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
   fi
 fi
+
+# TPROXY self-heal: сервер выбран, трафикация не выключена и sing-box жив, но
+# nft-таблица заворота пропала (например не переподнялась после ребута) → трафик
+# уходит НАПРЯМУЮ мимо VPN. Переподнимаем заворот — «включено, а идёт напрямую»
+# чинится само (крон гоняет скрипт раз в минуту).
+if [ -s /etc/space-link/active-server ] && pgrep sing-box >/dev/null 2>&1 \
+   && ! grep -q '"active":[[:space:]]*true' /etc/space-link/watchdog.json 2>/dev/null; then
+  if command -v nft >/dev/null 2>&1 && ! nft list table inet space_link >/dev/null 2>&1; then
+    log "TPROXY-таблица пропала при активном сервере — переподнимаю заворот трафика"
+    /etc/init.d/space-link-tproxy start >/dev/null 2>&1 || /etc/init.d/space-link-tproxy reload >/dev/null 2>&1 || true
+  fi
+fi
 WATCHDOG
   chmod 0755 /usr/bin/space-link-panel-watchdog
   ok "panel watchdog"
