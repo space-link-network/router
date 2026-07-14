@@ -1157,6 +1157,22 @@ port="$(awk '/server.port/ { print $3; exit }' "$conf" 2>/dev/null)"
 panel_url="http://$bind:$port/"
 [ "$port" = "80" ] && panel_url="http://$bind/"
 
+# Secondary-IP self-heal: панель слушает на $bind (напр. 192.168.1.2). После
+# ребута netifd иногда не поднимает второй адрес вовремя (или lighttpd стартует
+# раньше него) → .1.2 недоступен и панель/домен мертвы, хотя VPN работает. Если
+# $bind не на br-lan — поднимаем напрямую (не рвёт сеть) и рестартуем lighttpd.
+case "$bind" in
+  127.*|"") ;;
+  *)
+    if ! ip addr show br-lan 2>/dev/null | grep -q "inet $bind/"; then
+      log "панельный IP $bind не поднят на br-lan — добавляю и перезапускаю lighttpd"
+      ip addr add "$bind/24" dev br-lan 2>/dev/null || true
+      restart_service lighttpd "panel IP $bind was missing after boot"
+      sleep 2
+    fi
+    ;;
+esac
+
 if ! pgrep -x lighttpd >/dev/null 2>&1; then
   restart_service lighttpd "process not running"
   sleep 2
