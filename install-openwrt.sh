@@ -30,7 +30,7 @@ ROUTER_IP=""
 # Пакеты, критичные для ПАНЕЛИ/ДОМЕНА — установка прерывается, если чего-то нет.
 # sing-box (VPN-движок) СОЗНАТЕЛЬНО не здесь: его отсутствие не должно мешать
 # подняться панели и my.space (см. цикл движка в install_packages).
-REQUIRED_PKGS="ca-certificates curl lighttpd lighttpd-mod-proxy lighttpd-mod-rewrite lighttpd-mod-redirect"
+REQUIRED_PKGS="ca-certificates curl lighttpd lighttpd-mod-proxy lighttpd-mod-rewrite lighttpd-mod-redirect lighttpd-mod-setenv"
 # VPN-движок — best-effort: если недоступен в фиде, WARN и продолжаем, чтобы
 # панель/домен всё равно поднялись; движок можно доустановить позже.
 ENGINE_PKGS="sing-box"
