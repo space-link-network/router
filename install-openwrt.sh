@@ -487,6 +487,15 @@ install_templates() {
   fi
   chmod 0755 /etc/init.d/space-link
   ok "init.d"
+
+  # Reversible dnsmasq -> sing-box forwarding controller.
+  if [ -f "$SCRIPT_DIR/../templates/space-link-dns" ]; then
+    cp "$SCRIPT_DIR/../templates/space-link-dns" /usr/bin/space-link-dns
+  else
+    fetch "$RELEASE_BASE/space-link-dns" /usr/bin/space-link-dns || warn "DNS controller пропущен"
+  fi
+  chmod 0755 /usr/bin/space-link-dns 2>/dev/null || true
+  ok "DNS controller"
 }
 
 # ---- panel IP alias --------------------------------------------------------
@@ -840,16 +849,16 @@ HOOK
 enable_services() {
   step "Включение сервисов"
 
-  # sing-box — ставим минимальный заглушечный конфиг (direct outbound, без
-  # inbounds), чтобы init.d не падал до того, как Go API отрендерит реальный
-  # config.json с активным сервером. С v0.2.0 движок sing-box заменил xray-core.
+  # sing-box — ставим минимальный direct-конфиг с локальным DNS-inbound.
+  # Благодаря этому dnsmasq может безопасно использовать 127.0.0.42 даже до
+  # выбора сервера; после выбора Go API заменит стаб полным конфигом.
   if [ ! -s /etc/sing-box/config.json ]; then
     mkdir -p /etc/sing-box
     if [ -f "$SCRIPT_DIR/../templates/sing-box-stub.json" ]; then
       cp "$SCRIPT_DIR/../templates/sing-box-stub.json" /etc/sing-box/config.json
     else
       fetch "$RELEASE_BASE/sing-box-stub.json" /etc/sing-box/config.json 2>/dev/null || \
-        printf '%s\n' '{"log":{"level":"warn"},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}]}' > /etc/sing-box/config.json
+        printf '%s\n' '{"log":{"level":"warn"},"dns":{"servers":[{"tag":"direct-dns","address":"https://9.9.9.9/dns-query","detour":"direct"}],"final":"direct-dns"},"inbounds":[{"type":"direct","tag":"dns-in","listen":"127.0.0.42","listen_port":53,"sniff":true}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"default_domain_resolver":"direct-dns","final":"direct","rules":[{"protocol":"dns","action":"hijack-dns"}]}}' > /etc/sing-box/config.json
     fi
   fi
   # ---- sing-box capabilities ----------------------------------------------
@@ -993,7 +1002,9 @@ configure_dns() {
     if [ -f /etc/dnsmasq.conf ]; then
       sed -i "/my\\.spacelink/d" /etc/dnsmasq.conf 2>/dev/null || true
       sed -i "/spacelink\\.lan/d" /etc/dnsmasq.conf 2>/dev/null || true
+      sed -i "/my\\.sapce/d" /etc/dnsmasq.conf 2>/dev/null || true
       printf 'address=/my.space/%s\n' "$EFFECTIVE_BIND" >> /etc/dnsmasq.conf
+      printf 'address=/my.sapce/%s\n' "$EFFECTIVE_BIND" >> /etc/dnsmasq.conf
       /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
       ok "my.space → $EFFECTIVE_BIND (через dnsmasq.conf)"
     else
@@ -1005,6 +1016,7 @@ configure_dns() {
   _dns_uci_purge_all
   _dns_sed_scrub
   uci -q add_list dhcp.@dnsmasq[0].address="/my.space/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
+  uci -q add_list dhcp.@dnsmasq[0].address="/my.sapce/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
   uci -q commit dhcp >/dev/null 2>&1 || true
   /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
   sleep 2
@@ -1033,6 +1045,7 @@ configure_dns() {
   if _dns_verify; then
     # Базу подняли. Аккуратно докинем my.space ещё раз.
     uci -q add_list dhcp.@dnsmasq[0].address="/my.space/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
+    uci -q add_list dhcp.@dnsmasq[0].address="/my.sapce/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
     uci -q commit dhcp >/dev/null 2>&1 || true
     /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
     sleep 2
@@ -1043,11 +1056,28 @@ configure_dns() {
       # чем DHCP/DNS клиентам.
       warn "my.space ломает dnsmasq — оставляю без alias, открывай по IP: http://$EFFECTIVE_BIND"
       uci -q del_list dhcp.@dnsmasq[0].address="/my.space/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
+      uci -q del_list dhcp.@dnsmasq[0].address="/my.sapce/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
       uci -q commit dhcp >/dev/null 2>&1 || true
       /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
     fi
   else
     err "dnsmasq не стартует даже с заводского конфига. Проверь logread -e dnsmasq."
+  fi
+}
+
+# Podkop-style DNS path: clients -> dnsmasq -> sing-box 127.0.0.42:53.
+# The controller probes both layers and restores the previous resolver on any
+# failure, so a sing-box/config error cannot take down all LAN name resolution.
+configure_protected_dns() {
+  step "DNS через защищённое соединение"
+  if [ ! -x /usr/bin/space-link-dns ]; then
+    warn "DNS controller отсутствует — оставляю текущий upstream dnsmasq"
+    return 0
+  fi
+  if /usr/bin/space-link-dns enable >/dev/null 2>&1; then
+    ok "dnsmasq → sing-box 127.0.0.42:53"
+  else
+    warn "sing-box DNS не ответил — сохранён прежний рабочий DNS"
   fi
 }
 
@@ -1057,6 +1087,7 @@ _dns_uci_purge_all() {
   for ip in 192.168.1.1 192.168.1.2 192.168.1.3 192.168.1.100 192.168.1.101 192.168.0.1 "$ROUTER_IP" "$EFFECTIVE_BIND"; do
     [ -n "$ip" ] || continue
     uci -q del_list dhcp.@dnsmasq[0].address="/my.space/$ip" >/dev/null 2>&1 || true
+    uci -q del_list dhcp.@dnsmasq[0].address="/my.sapce/$ip" >/dev/null 2>&1 || true
     # legacy: spacelink.lan — канонический хост до v0.2.8, заменён на my.space.
     uci -q del_list dhcp.@dnsmasq[0].address="/spacelink.lan/$ip" >/dev/null 2>&1 || true
     # legacy: my.spacelink — браузеры (особенно мобильный Safari) не
@@ -1068,7 +1099,7 @@ _dns_uci_purge_all() {
   if [ -n "$addrs" ]; then
     for a in $addrs; do
       case "$a" in
-        */my.space/*|*/spacelink.lan/*|*/my.spacelink/*)
+        */my.space/*|*/my.sapce/*|*/spacelink.lan/*|*/my.spacelink/*)
           uci -q del_list dhcp.@dnsmasq[0].address="$a" >/dev/null 2>&1 || true
           ;;
       esac
@@ -1086,18 +1117,17 @@ _dns_sed_scrub() {
   # BusyBox sed: \{1,\} не поддерживается, используем простые паттерны.
   sed -i '/list address.*\\/d' /etc/config/dhcp 2>/dev/null || true
   sed -i '/list address.*my\.space\//d' /etc/config/dhcp 2>/dev/null || true
+  sed -i '/list address.*my\.sapce\//d' /etc/config/dhcp 2>/dev/null || true
   sed -i '/list address.*spacelink\.lan/d' /etc/config/dhcp 2>/dev/null || true
   sed -i '/list address.*my\.spacelink/d' /etc/config/dhcp 2>/dev/null || true
 }
 
-# Проверка: процесс жив И DNS реально отвечает.
+# Проверка: процесс жив, а оба локальных имени панели отвечает сам роутер.
 _dns_verify() {
   pgrep dnsmasq >/dev/null 2>&1 || return 1
   if command -v nslookup >/dev/null 2>&1; then
-    # Резолвим ЛОКАЛЬНОЕ имя (localhost из /etc/hosts) — не зависим от внешней
-    # доступности: в РФ при блокировках gitlab/openwrt не резолвятся, и честно
-    # живой dnsmasq ложно признавался «сломанным».
-    nslookup localhost 127.0.0.1 >/dev/null 2>&1 && return 0
+    nslookup my.space 127.0.0.1 2>/dev/null | grep -q "$EFFECTIVE_BIND" || return 1
+    nslookup my.sapce 127.0.0.1 2>/dev/null | grep -q "$EFFECTIVE_BIND" || return 1
   fi
   # Без nslookup доверяем pgrep — это всё ещё лучше, чем ничего.
   return 0
@@ -1189,17 +1219,35 @@ elif ! panel_ok "$panel_url" "my.space"; then
   log "panel still not reachable after lighttpd restart ($panel_url)"
 fi
 
-# my.space self-heal: если наш dnsmasq-алиас перестал резолвиться в панельный IP
-# (dnsmasq перезапустился с чистым конфигом / запись слетела) — переподнимаем.
-# Запрос локальный (127.0.0.1), не зависит от внешней сети/блокировок. Крон
-# гоняет этот скрипт раз в минуту, так что домен восстанавливается сам.
+# Local panel aliases self-heal. my.space is canonical; my.sapce is retained
+# as a typo-safe alias so it never escapes to the public parked domain.
 if command -v uci >/dev/null 2>&1 && command -v nslookup >/dev/null 2>&1; then
-  if ! nslookup my.space 127.0.0.1 2>/dev/null | grep -q "$bind"; then
-    log "my.space не резолвит в $bind — переподнимаю dnsmasq-алиас"
-    uci -q del_list dhcp.@dnsmasq[0].address="/my.space/$bind" >/dev/null 2>&1 || true
-    uci -q add_list dhcp.@dnsmasq[0].address="/my.space/$bind" >/dev/null 2>&1 || true
+  aliases_ok=1
+  for host in my.space my.sapce; do
+    nslookup "$host" 127.0.0.1 2>/dev/null | grep -q "$bind" || aliases_ok=0
+  done
+  if [ "$aliases_ok" != "1" ]; then
+    log "алиасы панели не резолвят в $bind — переподнимаю"
+    for host in my.space my.sapce; do
+      uci -q del_list dhcp.@dnsmasq[0].address="/$host/$bind" >/dev/null 2>&1 || true
+      uci -q add_list dhcp.@dnsmasq[0].address="/$host/$bind" >/dev/null 2>&1 || true
+    done
     uci -q commit dhcp >/dev/null 2>&1 || true
     /etc/init.d/dnsmasq reload >/dev/null 2>&1 || /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+  fi
+fi
+
+# Protected DNS self-heal/fail-open. A running process is not enough: verify
+# that dnsmasq can resolve through 127.0.0.42. If repair fails, restore the
+# pre-Space-Link resolver so clients keep internet instead of losing all DNS.
+if [ -x /usr/bin/space-link-dns ] \
+   && ! grep -q '"active":[[:space:]]*true' /etc/space-link/watchdog.json 2>/dev/null; then
+  if ! /usr/bin/space-link-dns status >/dev/null 2>&1; then
+    log "защищённый DNS не отвечает — пробую переподключить"
+    if ! /usr/bin/space-link-dns enable >/dev/null 2>&1; then
+      /usr/bin/space-link-dns disable >/dev/null 2>&1 || true
+      log "защищённый DNS не восстановлен — включён прежний DNS (fail-open)"
+    fi
   fi
 fi
 
@@ -1356,9 +1404,10 @@ install_rules
 configure_panel_ip
 install_templates
 save_state
-configure_dns
 configure_tproxy
 enable_services
+configure_dns
+configure_protected_dns
 install_panel_watchdog
 install_cron
 final_summary

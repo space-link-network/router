@@ -5,6 +5,10 @@ set -eu
 STATE_DIR="/etc/space-link"
 INSTALL_DIR="/opt/space-link"
 
+if [ -x /usr/bin/space-link-dns ]; then
+  /usr/bin/space-link-dns purge >/dev/null 2>&1 || true
+fi
+
 printf '==> Останавливаю сервисы\n'
 /etc/init.d/space-link stop 2>/dev/null || true
 /etc/init.d/space-link disable 2>/dev/null || true
@@ -21,6 +25,7 @@ rm -rf /etc/sing-box 2>/dev/null || true
 # версии, тоже подметаем. На свежей v0.2.0 уже отсутствуют — rm молча проходит.
 rm -rf /etc/xray 2>/dev/null || true
 rm -f /usr/bin/geoip.dat /usr/bin/geosite.dat 2>/dev/null || true
+rm -f /usr/bin/space-link-dns 2>/dev/null || true
 rm -rf "$INSTALL_DIR"
 
 # Сохраняем токен по умолчанию — позволяет переустановку без повторного ввода.
@@ -59,7 +64,7 @@ if command -v fw4 >/dev/null 2>&1; then
   fw4 reload >/dev/null 2>&1 || true
 fi
 if [ -f /etc/iproute2/rt_tables ]; then
-  sed -i "/^[[:space:]]*$TPROXY_TABLE[[:space:]]\+space-link/d" /etc/iproute2/rt_tables 2>/dev/null || true
+  sed -i "/^[[:space:]]*${TPROXY_TABLE}[[:space:]]\+space-link/d" /etc/iproute2/rt_tables 2>/dev/null || true
 fi
 
 printf '==> Чищу dnsmasq alias (uci + dnsmasq.conf)\n'
@@ -68,7 +73,7 @@ if command -v uci >/dev/null 2>&1; then
   if [ -n "$addrs" ]; then
     for a in $addrs; do
       case "$a" in
-        */my.space/*|*/my.spacelink/*|*/spacelink.lan/*)
+        */my.space/*|*/my.sapce/*|*/my.spacelink/*|*/spacelink.lan/*)
           uci -q del_list dhcp.@dnsmasq[0].address="$a" >/dev/null 2>&1 || true
           ;;
       esac
@@ -78,6 +83,7 @@ if command -v uci >/dev/null 2>&1; then
 fi
 if [ -f /etc/dnsmasq.conf ]; then
   sed -i '/^address=\/my\.space\//d' /etc/dnsmasq.conf 2>/dev/null || true
+  sed -i '/^address=\/my\.sapce\//d' /etc/dnsmasq.conf 2>/dev/null || true
   sed -i '/^address=\/my\.spacelink\//d' /etc/dnsmasq.conf 2>/dev/null || true
   sed -i '/^address=\/spacelink\.lan\//d' /etc/dnsmasq.conf 2>/dev/null || true
 fi
