@@ -717,6 +717,11 @@ table inet space_link {
     chain prerouting {
         type filter hook prerouting priority mangle; policy accept;
 
+        # DNS-tunnel (по тумблеру dns_tunnel): перехват 53 ДО private/local
+        # исключений, чтобы запросы к dnsmasq на LAN-адресе роутера не утекали.
+        ${DNS_RULE_V4}
+        ${DNS_RULE_V6}
+
         # IPv4 private / special-use исключения — этот трафик НЕ заворачиваем.
         ip daddr 0.0.0.0/8        return
         ip daddr 10.0.0.0/8       return
@@ -742,15 +747,12 @@ table inet space_link {
 
         fib daddr type local      return
 
-        # DNS-tunnel (по тумблеру dns_tunnel): перехват 53 ДО общего правила.
-        ${DNS_RULE_V4}
-        ${DNS_RULE_V6}
 
         # QUIC-block (по тумблеру block_quic): режем UDP/443 → TCP-fallback.
         ${QUIC_RULE}
 
         # Основной заворот: TCP+UDP из LAN на tproxy-инбаунд sing-box.
-        # Парные правила для IPv4 и IPv6 (`tproxy ip` / `tproxy ip6`).
+        # Парные правила для IPv4 и IPv6 (tproxy ip / tproxy ip6).
         iifname "br-lan" meta l4proto { tcp, udp } meta nfproto ipv4 tproxy ip to :__TPROXY_PORT__ meta mark set __TPROXY_MARK__ accept
         iifname "br-lan" meta l4proto { tcp, udp } meta nfproto ipv6 tproxy ip6 to :__TPROXY_PORT__ meta mark set __TPROXY_MARK__ accept
     }
