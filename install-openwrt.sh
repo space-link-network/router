@@ -126,7 +126,7 @@ wait_service_up() {
     if /etc/init.d/"$svc" status 2>/dev/null | grep -q running; then
       return 0
     fi
-    if pgrep -x "$svc" >/dev/null 2>&1; then
+    if pgrep "^${svc}$" >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
@@ -811,7 +811,7 @@ clear_path() {
 }
 
 engine_ready() {
-  pgrep -x sing-box >/dev/null 2>&1 || return 1
+  pgrep "^sing-box$" >/dev/null 2>&1 || return 1
   command -v netstat >/dev/null 2>&1 || return 1
   netstat -ln 2>/dev/null | grep -Eq '[:.]12345[[:space:]]'
 }
@@ -854,7 +854,7 @@ INITD
 #!/bin/sh
 # fw4 reload may remove the standalone table. Restore it only while the
 # health-gated path is armed and the destination listener still exists.
-if [ -f /etc/space-link/tproxy.armed ] && pgrep -x sing-box >/dev/null 2>&1; then
+if [ -f /etc/space-link/tproxy.armed ] && pgrep "^sing-box$" >/dev/null 2>&1; then
   /etc/init.d/space-link-tproxy reload >/dev/null 2>&1 || /etc/init.d/space-link-tproxy stop >/dev/null 2>&1
 else
   /etc/init.d/space-link-tproxy stop >/dev/null 2>&1
@@ -878,7 +878,7 @@ traffic_engine_ready() {
   if [ -x /usr/bin/sing-box ]; then
     /usr/bin/sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1 || return 1
   fi
-  pgrep -x sing-box >/dev/null 2>&1 || return 1
+  pgrep "^sing-box$" >/dev/null 2>&1 || return 1
   command -v netstat >/dev/null 2>&1 || return 1
   netstat -ln 2>/dev/null | grep -Eq '[:.]12345[[:space:]]' || return 1
 }
@@ -1519,7 +1519,7 @@ final_summary() {
     printf '   lighttpd:        ERR не запущен — панель недоступна\n'
   fi
 
-  if pgrep -x sing-box >/dev/null 2>&1; then
+  if pgrep "^sing-box$" >/dev/null 2>&1; then
     printf '   sing-box:        OK  работает\n'
   else
     printf '   sing-box:        --  не запущен (норма пока не выбран сервер)\n'
