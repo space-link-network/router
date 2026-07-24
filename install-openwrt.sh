@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.6"
+VERSION="0.3.31"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -14,6 +14,10 @@ INSTALL_DIR="/opt/space-link"
 WWW_DIR="$INSTALL_DIR/www"
 RULES_DIR="$INSTALL_DIR/rules"
 BIN_PATH="$INSTALL_DIR/space-link-api"
+INSTALL_TMP_DIR="${INSTALL_TMP_DIR:-/tmp}"
+ENGINE_LOCK_DIR="${SPACE_LINK_ENGINE_LOCK:-/tmp/space-link-engine.lock}"
+ENGINE_LOCK_RETRIES="${SPACE_LINK_ENGINE_LOCK_RETRIES:-30}"
+ENGINE_LOCK_HELD=0
 
 # Где живёт наша панель. По умолчанию — alias-IP на LAN-интерфейсе чтобы
 # не конфликтовать с uhttpd (LuCI). Если alias не поднимется, упадём в
@@ -139,6 +143,96 @@ wait_service_up() {
 # вместе с симлинком *.latest.uci на актуальный. Используется чтобы при любой
 # поломке (наш баг, неудачный network reload, битый dhcp.address) можно было
 # вернуться к рабочему состоянию.
+prune_backup_files() {
+  keep="$1"
+  shift
+  [ "$#" -gt "$keep" ] || return 0
+  remove=$(( $# - keep ))
+  for file in "$@"; do
+    [ "$remove" -gt 0 ] || break
+    [ -e "$file" ] || continue
+    rm -f "$file" 2>/dev/null || true
+    remove=$(( remove - 1 ))
+  done
+}
+
+prune_uci_backups() {
+  for conf in dhcp network firewall wireless; do
+    prune_backup_files 5 "$BACKUP_DIR/$conf".[0-9]*.uci
+    prune_backup_files 5 "$BACKUP_DIR/$conf.raw".[0-9]*
+  done
+  prune_backup_files 3 "$BACKUP_DIR"/dhcp.broken.[0-9]*
+  prune_backup_files 3 "$BACKUP_DIR"/dhcp.preinstall.[0-9]*
+}
+
+cleanup_install_artifacts() {
+  for file in \
+    "$INSTALL_TMP_DIR"/space-link-*.tar.gz \
+    "$INSTALL_TMP_DIR"/space-link-*.tmp \
+    "$INSTALL_TMP_DIR"/space-link-*.part
+  do
+    [ -e "$file" ] && rm -f "$file" 2>/dev/null || true
+  done
+  if command -v apk >/dev/null 2>&1; then
+    apk cache clean >/dev/null 2>&1 || true
+  fi
+  rm -f "$BIN_PATH.new" 2>/dev/null || true
+  for dir in "$INSTALL_DIR"/.www.new.*; do
+    [ -e "$dir" ] && rm -rf "$dir" 2>/dev/null || true
+  done
+  for dir in "$INSTALL_DIR"/.www.old.*; do
+    [ -e "$dir" ] || continue
+    if [ ! -e "$WWW_DIR" ]; then
+      mv "$dir" "$WWW_DIR" 2>/dev/null || true
+    else
+      rm -rf "$dir" 2>/dev/null || true
+    fi
+  done
+}
+
+acquire_engine_lock() {
+  attempt=0
+  while [ "$attempt" -lt "$ENGINE_LOCK_RETRIES" ]; do
+    if mkdir "$ENGINE_LOCK_DIR" 2>/dev/null; then
+      printf '%s\n' "$$" > "$ENGINE_LOCK_DIR/owner"
+      ENGINE_LOCK_HELD=1
+      return 0
+    fi
+    owner=""
+    [ -r "$ENGINE_LOCK_DIR/owner" ] && owner=$(cat "$ENGINE_LOCK_DIR/owner" 2>/dev/null || true)
+    case "$owner" in
+      ''|*[!0-9]*)
+        # Allow a concurrent process to finish mkdir -> owner before treating
+        # an ownerless directory as stale.
+        sleep 1
+        [ -r "$ENGINE_LOCK_DIR/owner" ] || rm -rf "$ENGINE_LOCK_DIR" 2>/dev/null || true
+        ;;
+      *)
+        kill -0 "$owner" 2>/dev/null || rm -rf "$ENGINE_LOCK_DIR" 2>/dev/null || true
+        sleep 1
+        ;;
+    esac
+    attempt=$(( attempt + 1 ))
+  done
+  die "Другая операция с VPN ещё выполняется. Повтори через минуту."
+}
+
+release_engine_lock() {
+  [ "$ENGINE_LOCK_HELD" = "1" ] || return 0
+  owner=""
+  [ -r "$ENGINE_LOCK_DIR/owner" ] && owner=$(cat "$ENGINE_LOCK_DIR/owner" 2>/dev/null || true)
+  [ "$owner" = "$$" ] || return 0
+  rm -f "$ENGINE_LOCK_DIR/owner" 2>/dev/null || true
+  rmdir "$ENGINE_LOCK_DIR" 2>/dev/null || true
+  ENGINE_LOCK_HELD=0
+}
+
+installer_exit() {
+  [ "$ENGINE_LOCK_HELD" = "1" ] || return 0
+  cleanup_install_artifacts
+  release_engine_lock
+}
+
 backup_uci_state() {
   mkdir -p "$BACKUP_DIR"
   ts=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo unknown)
@@ -153,7 +247,8 @@ backup_uci_state() {
   for f in dhcp network firewall wireless; do
     [ -r "/etc/config/$f" ] && cp "/etc/config/$f" "$BACKUP_DIR/$f.raw.$ts" 2>/dev/null || true
   done
-  ok "снапшот UCI: $BACKUP_DIR (ts=$ts)"
+  prune_uci_backups
+  ok "снапшот UCI: $BACKUP_DIR (ts=$ts; хранится до 5 поколений)"
 }
 
 rollback_uci() {
@@ -440,10 +535,25 @@ install_binary() {
 
 install_ui() {
   step "Загрузка UI bundle"
-  mkdir -p "$WWW_DIR"
-  fetch "$RELEASE_BASE/ui.tar.gz" /tmp/space-link-ui.tar.gz || die "Не удалось скачать ui.tar.gz"
-  tar -xzf /tmp/space-link-ui.tar.gz -C "$WWW_DIR"
-  rm -f /tmp/space-link-ui.tar.gz
+  mkdir -p "$INSTALL_DIR" "$INSTALL_TMP_DIR"
+  archive="$INSTALL_TMP_DIR/space-link-ui.tar.gz"
+  stage="$INSTALL_DIR/.www.new.$$"
+  old="$INSTALL_DIR/.www.old.$$"
+  rm -rf "$stage" "$old"
+  fetch "$RELEASE_BASE/ui.tar.gz" "$archive" || die "Не удалось скачать ui.tar.gz"
+  mkdir -p "$stage"
+  tar -xzf "$archive" -C "$stage" || die "Не удалось распаковать ui.tar.gz"
+  [ -f "$stage/index.html" ] || die "В ui.tar.gz отсутствует index.html"
+
+  if [ -e "$WWW_DIR" ]; then
+    mv "$WWW_DIR" "$old" || die "Не удалось подготовить замену UI"
+  fi
+  if ! mv "$stage" "$WWW_DIR"; then
+    [ -e "$old" ] && mv "$old" "$WWW_DIR" 2>/dev/null || true
+    die "Не удалось активировать новый UI"
+  fi
+  rm -rf "$old"
+  rm -f "$archive"
   ok "$WWW_DIR"
 }
 
@@ -1580,10 +1690,13 @@ final_summary() {
 }
 
 # ---- main ------------------------------------------------------------------
+trap installer_exit EXIT
 banner
 printf '   Версия: %s   Режим: %s\n\n' "$VERSION" "$mode"
 
 preflight
+prompt_token
+acquire_engine_lock
 # Снапшот рабочих конфигов ДО любых правок — для отката если что-то пойдёт не так.
 mkdir -p "$BACKUP_DIR" 2>/dev/null || true
 backup_uci_state
@@ -1592,7 +1705,6 @@ backup_uci_state
 disarm_traffic_path
 # Если dnsmasq уже лежит от прошлой кривой установки или ручных правок — чиним.
 ensure_dnsmasq_alive
-prompt_token
 install_packages
 migrate_from_xray
 install_binary
