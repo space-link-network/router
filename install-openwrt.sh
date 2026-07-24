@@ -621,32 +621,33 @@ configure_tproxy() {
   TPROXY_MARK="${TPROXY_MARK:-255}"
   TPROXY_TABLE="${TPROXY_TABLE:-100}"
 
-  # Anti-leak тумблеры.
-  #   dns_tunnel  — весь DNS из LAN через туннель. Дефолт ВКЛ (v0.3.9): без
-  #                 него роутер резолвит открытым :53 по РФ-каналу, где ТСПУ
-  #                 ломает DNS заблокированных доменов (proton.me → SERVFAIL) —
-  #                 сайт не открывается даже при живом туннеле. Для VPN-роутера
-  #                 это единственно верный дефолт.
-  #   block_quic  — режем UDP/443 (QUIC) из LAN → браузеры откатываются на
-  #                 TCP/TLS. В transparent-router режиме это стабильнее для
-  #                 HTTP/3-сайтов вроде Proton Mail: браузер не зависает на
-  #                 UDP-сессии, а открывает тот же домен через TCP, который
-  #                 sing-box уверенно sniff'ит и туннелирует.
-  # Переопределяется: uci set space-link.tproxy.dns_tunnel=0; commit; reload —
-  # или из окружения TPROXY_DNS_TUNNEL / TPROXY_BLOCK_QUIC при установке.
+  # Anti-leak controls.
+  #   dns_tunnel — keep external port-53 traffic inside the protected path.
+  #   block_quic — optional troubleshooting switch only. Native applications
+  #                such as YouTube do not reliably fall back from QUIC, so
+  #                UDP/443 must be proxied by default rather than rejected.
   DNS_TUNNEL="${TPROXY_DNS_TUNNEL:-$(uci -q get space-link.tproxy.dns_tunnel 2>/dev/null || echo 1)}"
-  BLOCK_QUIC="${TPROXY_BLOCK_QUIC:-$(uci -q get space-link.tproxy.block_quic 2>/dev/null || echo 1)}"
+  if [ -n "${TPROXY_BLOCK_QUIC+x}" ]; then
+    BLOCK_QUIC="$TPROXY_BLOCK_QUIC"
+  elif [ "$(uci -q get space-link.tproxy.quic_default_v026 2>/dev/null || echo 0)" != "1" ]; then
+    # v0.3.25 persisted the harmful value 1 as its default. Clear it exactly
+    # once on both upgrades and fresh installs; later explicit UCI choices are
+    # preserved after the migration marker exists.
+    BLOCK_QUIC=0
+  else
+    BLOCK_QUIC="$(uci -q get space-link.tproxy.block_quic 2>/dev/null || echo 0)"
+  fi
 
-  # Зафиксируем дефолты в uci, чтобы UI/CLI могли их читать и переключать.
+  # Persist effective values so diagnostics and future repair installs agree.
   if ! uci -q get space-link.tproxy >/dev/null 2>&1; then
     uci -q set space-link=tproxy 2>/dev/null || {
-      # space-link config-файла ещё нет — создаём пустой и секцию.
       touch /etc/config/space-link 2>/dev/null || true
       uci -q set space-link.tproxy=tproxy 2>/dev/null || true
     }
   fi
   uci -q set space-link.tproxy.dns_tunnel="$DNS_TUNNEL" 2>/dev/null || true
   uci -q set space-link.tproxy.block_quic="$BLOCK_QUIC" 2>/dev/null || true
+  uci -q set space-link.tproxy.quic_default_v026=1 2>/dev/null || true
   uci -q commit space-link 2>/dev/null || true
 
   # 1) Убедимся что ядро умеет nft tproxy. Сначала пробуем modprobe, потом
@@ -987,24 +988,21 @@ save_state() {
 }
 
 # ---- dnsmasq alias ---------------------------------------------------------
-# Защищённая версия. Шаги:
-#   1) выгребаем все my.space-записи (uci del_list) и битые address'ы
-#      (sed по сырому /etc/config/dhcp — кавычки, лишние слэши).
-#   2) добавляем /my.space/$EFFECTIVE_BIND.
-#   3) commit + restart + sleep 2 + verify (pgrep dnsmasq && nslookup gitlab.com).
-#   4) если verify провалился — откат через rollback_uci (наш свежий снапшот),
-#      затем /rom/etc/config/dhcp как последний резерв. После каждого отката
-#      делаем ещё одну попытку добавить my.space.
+# dnsmasq 2.86+ forwards non-A/AAAA queries (including HTTPS/SVCB) upstream
+# when a domain has only address=/domain/IP. A public answer for my.space can
+# therefore escape the router even while its A record is local. We install an
+# empty address=/domain/ rule beside the IPv4 answer: the IP rule wins for A,
+# while the empty rule makes every other RR type local and non-forwarded.
+#
+# Every write first removes all current and legacy Space Link values. This
+# makes repair/update runs deterministic and prevents conflicting answers from
+# surviving a dnsmasq restart or config reload.
 configure_dns() {
   step "Регистрация my.space → $EFFECTIVE_BIND в dnsmasq"
 
   if ! command -v uci >/dev/null 2>&1; then
     if [ -f /etc/dnsmasq.conf ]; then
-      sed -i "/my\\.spacelink/d" /etc/dnsmasq.conf 2>/dev/null || true
-      sed -i "/spacelink\\.lan/d" /etc/dnsmasq.conf 2>/dev/null || true
-      sed -i "/my\\.sapce/d" /etc/dnsmasq.conf 2>/dev/null || true
-      printf 'address=/my.space/%s\n' "$EFFECTIVE_BIND" >> /etc/dnsmasq.conf
-      printf 'address=/my.sapce/%s\n' "$EFFECTIVE_BIND" >> /etc/dnsmasq.conf
+      _dns_file_normalize /etc/dnsmasq.conf
       /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
       ok "my.space → $EFFECTIVE_BIND (через dnsmasq.conf)"
     else
@@ -1013,10 +1011,8 @@ configure_dns() {
     return 0
   fi
 
-  _dns_uci_purge_all
   _dns_sed_scrub
-  uci -q add_list dhcp.@dnsmasq[0].address="/my.space/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
-  uci -q add_list dhcp.@dnsmasq[0].address="/my.sapce/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
+  _dns_uci_normalize
   uci -q commit dhcp >/dev/null 2>&1 || true
   /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
   sleep 2
@@ -1043,20 +1039,18 @@ configure_dns() {
   fi
 
   if _dns_verify; then
-    # Базу подняли. Аккуратно докинем my.space ещё раз.
-    uci -q add_list dhcp.@dnsmasq[0].address="/my.space/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
-    uci -q add_list dhcp.@dnsmasq[0].address="/my.sapce/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
+    # Базу подняли. Нормализуем локальные зоны ещё раз.
+    _dns_uci_normalize
     uci -q commit dhcp >/dev/null 2>&1 || true
     /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
     sleep 2
     if _dns_verify; then
       ok "dnsmasq восстановлен, my.space → $EFFECTIVE_BIND"
     else
-      # Снова легло именно от нашей записи. Лучше потерять my.space
+      # Снова легло именно от наших записей. Лучше потерять my.space
       # чем DHCP/DNS клиентам.
       warn "my.space ломает dnsmasq — оставляю без alias, открывай по IP: http://$EFFECTIVE_BIND"
-      uci -q del_list dhcp.@dnsmasq[0].address="/my.space/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
-      uci -q del_list dhcp.@dnsmasq[0].address="/my.sapce/$EFFECTIVE_BIND" >/dev/null 2>&1 || true
+      _dns_uci_purge_all
       uci -q commit dhcp >/dev/null 2>&1 || true
       /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
     fi
@@ -1081,30 +1075,46 @@ configure_protected_dns() {
   fi
 }
 
-# Vsё, что когда-либо могло быть нашим address-ом — удаляем. Перебираем известные
-# IP-кандидаты + текущие значения; del_list по несуществующему — безопасно.
+# Remove every current or legacy rule owned by Space Link. Matching the values
+# already present is what removes unknown stale IPs; the fixed candidate list
+# alone cannot do that reliably.
 _dns_uci_purge_all() {
-  for ip in 192.168.1.1 192.168.1.2 192.168.1.3 192.168.1.100 192.168.1.101 192.168.0.1 "$ROUTER_IP" "$EFFECTIVE_BIND"; do
-    [ -n "$ip" ] || continue
-    uci -q del_list dhcp.@dnsmasq[0].address="/my.space/$ip" >/dev/null 2>&1 || true
-    uci -q del_list dhcp.@dnsmasq[0].address="/my.sapce/$ip" >/dev/null 2>&1 || true
-    # legacy: spacelink.lan — канонический хост до v0.2.8, заменён на my.space.
-    uci -q del_list dhcp.@dnsmasq[0].address="/spacelink.lan/$ip" >/dev/null 2>&1 || true
-    # legacy: my.spacelink — браузеры (особенно мобильный Safari) не
-    # распознавали как URL, удаляем при первом же апгрейде до v0.2.6+.
-    uci -q del_list dhcp.@dnsmasq[0].address="/my.spacelink/$ip" >/dev/null 2>&1 || true
-  done
-  # Дополнительно — выгрести любое значение списка с любым из доменов.
   addrs=$(uci -q get dhcp.@dnsmasq[0].address 2>/dev/null || true)
-  if [ -n "$addrs" ]; then
-    for a in $addrs; do
-      case "$a" in
-        */my.space/*|*/my.sapce/*|*/spacelink.lan/*|*/my.spacelink/*)
-          uci -q del_list dhcp.@dnsmasq[0].address="$a" >/dev/null 2>&1 || true
-          ;;
-      esac
-    done
+  [ -n "$addrs" ] || return 0
+  for a in $addrs; do
+    case "$a" in
+      */my.space/*|*/my.sapce/*|*/spacelink.lan/*|*/my.spacelink/*)
+        uci -q del_list dhcp.@dnsmasq[0].address="$a" >/dev/null 2>&1 || true
+        ;;
+    esac
+  done
+}
+
+_dns_uci_normalize() {
+  _dns_uci_purge_all
+  uci -q add_list dhcp.@dnsmasq[0].address="/my.space/$EFFECTIVE_BIND" >/dev/null 2>&1 || return 1
+  uci -q add_list dhcp.@dnsmasq[0].address="/my.space/" >/dev/null 2>&1 || return 1
+  uci -q add_list dhcp.@dnsmasq[0].address="/my.sapce/$EFFECTIVE_BIND" >/dev/null 2>&1 || return 1
+  uci -q add_list dhcp.@dnsmasq[0].address="/my.sapce/" >/dev/null 2>&1 || return 1
+}
+
+# Non-UCI variants still read /etc/dnsmasq.conf. Rewrite only Space Link's
+# exact directives, preserving user DNS settings and unrelated local zones.
+_dns_file_normalize() {
+  conf="$1"
+  tmp="${conf}.space-link.$$"
+  if ! awk '
+    /^[[:space:]]*(address|local)=\/(my\.space|my\.sapce|my\.spacelink|spacelink\.lan)\// { next }
+    { print }
+  ' "$conf" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
   fi
+  printf 'address=/my.space/%s\n' "$EFFECTIVE_BIND" >> "$tmp"
+  printf 'local=/my.space/\n' >> "$tmp"
+  printf 'address=/my.sapce/%s\n' "$EFFECTIVE_BIND" >> "$tmp"
+  printf 'local=/my.sapce/\n' >> "$tmp"
+  mv "$tmp" "$conf"
 }
 
 # Sed по сырому /etc/config/dhcp. Снимает строки, в которых list address
@@ -1122,14 +1132,21 @@ _dns_sed_scrub() {
   sed -i '/list address.*my\.spacelink/d' /etc/config/dhcp 2>/dev/null || true
 }
 
-# Проверка: процесс жив, а оба локальных имени панели отвечает сам роутер.
+# Verify the process, exact authoritative UCI rules, and both IPv4 answers.
 _dns_verify() {
   pgrep dnsmasq >/dev/null 2>&1 || return 1
+  addrs=$(uci -q get dhcp.@dnsmasq[0].address 2>/dev/null || true)
+  for expected in "/my.space/$EFFECTIVE_BIND" "/my.space/" "/my.sapce/$EFFECTIVE_BIND" "/my.sapce/"; do
+    found=0
+    for a in $addrs; do
+      [ "$a" = "$expected" ] && found=$((found + 1))
+    done
+    [ "$found" = "1" ] || return 1
+  done
   if command -v nslookup >/dev/null 2>&1; then
     nslookup my.space 127.0.0.1 2>/dev/null | grep -q "$EFFECTIVE_BIND" || return 1
     nslookup my.sapce 127.0.0.1 2>/dev/null | grep -q "$EFFECTIVE_BIND" || return 1
   fi
-  # Без nslookup доверяем pgrep — это всё ещё лучше, чем ничего.
   return 0
 }
 
@@ -1138,6 +1155,15 @@ install_panel_watchdog() {
   step "Установка watchdog панели"
   cat > /usr/bin/space-link-panel-watchdog <<'WATCHDOG'
 #!/bin/sh
+
+# procd runs this mode continuously. Each check is a separate process so a
+# single stuck/failed command cannot permanently kill the recovery loop.
+if [ "${1:-}" = "--loop" ]; then
+  while :; do
+    "$0" --once
+    sleep 30
+  done
+fi
 # Self-heal for the local router panel. VPN data-plane may be fine while the
 # panel is down: API can die, or lighttpd can stop serving/proxying after boot.
 
@@ -1220,18 +1246,45 @@ elif ! panel_ok "$panel_url" "my.space"; then
 fi
 
 # Local panel aliases self-heal. my.space is canonical; my.sapce is retained
-# as a typo-safe alias so it never escapes to the public parked domain.
+# as a typo-safe alias so it never escapes to the public parked domain. Check
+# the persisted UCI values as well as A lookups: a lookup can contain the right
+# IP while a conflicting stale address or a missing HTTPS/SVCB blocker remains.
 if command -v uci >/dev/null 2>&1 && command -v nslookup >/dev/null 2>&1; then
   aliases_ok=1
+  canonical_ip=0
+  canonical_local=0
+  typo_ip=0
+  typo_local=0
+  addrs="$(uci -q get dhcp.@dnsmasq[0].address 2>/dev/null || true)"
+  for a in $addrs; do
+    case "$a" in
+      "/my.space/$bind") canonical_ip=$((canonical_ip + 1)) ;;
+      "/my.space/") canonical_local=$((canonical_local + 1)) ;;
+      "/my.sapce/$bind") typo_ip=$((typo_ip + 1)) ;;
+      "/my.sapce/") typo_local=$((typo_local + 1)) ;;
+      */my.space/*|*/my.sapce/*|*/spacelink.lan/*|*/my.spacelink/*) aliases_ok=0 ;;
+    esac
+  done
+  [ "$canonical_ip" = "1" ] || aliases_ok=0
+  [ "$canonical_local" = "1" ] || aliases_ok=0
+  [ "$typo_ip" = "1" ] || aliases_ok=0
+  [ "$typo_local" = "1" ] || aliases_ok=0
   for host in my.space my.sapce; do
     nslookup "$host" 127.0.0.1 2>/dev/null | grep -q "$bind" || aliases_ok=0
   done
   if [ "$aliases_ok" != "1" ]; then
-    log "алиасы панели не резолвят в $bind — переподнимаю"
-    for host in my.space my.sapce; do
-      uci -q del_list dhcp.@dnsmasq[0].address="/$host/$bind" >/dev/null 2>&1 || true
-      uci -q add_list dhcp.@dnsmasq[0].address="/$host/$bind" >/dev/null 2>&1 || true
+    log "panel DNS aliases are stale or non-authoritative; normalizing to $bind"
+    for a in $addrs; do
+      case "$a" in
+        */my.space/*|*/my.sapce/*|*/spacelink.lan/*|*/my.spacelink/*)
+          uci -q del_list dhcp.@dnsmasq[0].address="$a" >/dev/null 2>&1 || true
+          ;;
+      esac
     done
+    uci -q add_list dhcp.@dnsmasq[0].address="/my.space/$bind" >/dev/null 2>&1 || true
+    uci -q add_list dhcp.@dnsmasq[0].address="/my.space/" >/dev/null 2>&1 || true
+    uci -q add_list dhcp.@dnsmasq[0].address="/my.sapce/$bind" >/dev/null 2>&1 || true
+    uci -q add_list dhcp.@dnsmasq[0].address="/my.sapce/" >/dev/null 2>&1 || true
     uci -q commit dhcp >/dev/null 2>&1 || true
     /etc/init.d/dnsmasq reload >/dev/null 2>&1 || /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
   fi
@@ -1272,12 +1325,44 @@ install_cron() {
   step "Установка cron для heartbeat/watchdog"
   heartbeat_line="*/5 * * * * /usr/bin/wget -q -O- http://127.0.0.1:8080/api/local/status >/dev/null 2>&1 # space-link-heartbeat"
   watchdog_line="* * * * * /usr/bin/space-link-panel-watchdog >/dev/null 2>&1 # space-link-panel-watchdog"
+  cron_file="${CRONTAB_FILE:-/etc/crontabs/root}"
+  cron_init="${CRON_INIT:-/etc/init.d/cron}"
+  cron_tmp="/tmp/space-link-cron.$$"
+
+  mkdir -p "$(dirname "$cron_file")"
+  {
+    if command -v crontab >/dev/null 2>&1; then
+      crontab -l 2>/dev/null || true
+    elif [ -r "$cron_file" ]; then
+      cat "$cron_file"
+    fi
+  } | grep -v '# space-link-heartbeat$' \
+    | grep -v '# space-link-panel-watchdog$' > "$cron_tmp" || true
+  printf '%s\n%s\n' "$heartbeat_line" "$watchdog_line" >> "$cron_tmp"
+
+  # Prefer the platform frontend, but never trust only its exit code. The
+  # production failure that motivated this check returned success while the
+  # root crontab remained empty.
   if command -v crontab >/dev/null 2>&1; then
-    (crontab -l 2>/dev/null | grep -v 'space-link' ; printf '%s\n%s\n' "$heartbeat_line" "$watchdog_line") | crontab -
-    /etc/init.d/cron restart >/dev/null 2>&1 || true
-    ok "cron"
+    crontab "$cron_tmp" >/dev/null 2>&1 || true
+  fi
+  cron_snapshot="$(crontab -l 2>/dev/null || cat "$cron_file" 2>/dev/null || true)"
+  if [ "$(printf '%s\n' "$cron_snapshot" | grep -Fxc "$heartbeat_line" || true)" != "1" ] \
+     || [ "$(printf '%s\n' "$cron_snapshot" | grep -Fxc "$watchdog_line" || true)" != "1" ]; then
+    cp "$cron_tmp" "$cron_file"
+    chmod 0600 "$cron_file" 2>/dev/null || true
+    cron_snapshot="$(cat "$cron_file" 2>/dev/null || true)"
+  fi
+  rm -f "$cron_tmp"
+
+  "$cron_init" enable >/dev/null 2>&1 || true
+  "$cron_init" restart >/dev/null 2>&1 || true
+
+  if [ "$(printf '%s\n' "$cron_snapshot" | grep -Fxc "$heartbeat_line" || true)" = "1" ] \
+     && [ "$(printf '%s\n' "$cron_snapshot" | grep -Fxc "$watchdog_line" || true)" = "1" ]; then
+    ok "cron: heartbeat + panel watchdog"
   else
-    warn "crontab не найден — пропускаю"
+    warn "cron не сохранил watchdog; procd-supervisor остаётся активным"
   fi
 }
 
@@ -1357,6 +1442,17 @@ final_summary() {
     printf '   my.space:        --  не резолвит — открывай по %s\n' "$panel_url"
   fi
 
+  # Deliberately no TLS listener: without a locally trusted certificate an
+  # HTTPS redirect is impossible because the TLS handshake happens first.
+  # A refused :443 connection lets HTTPS-first browsers offer/fall back to the
+  # canonical HTTP URL; a stray TLS listener is surfaced explicitly.
+  if command -v curl >/dev/null 2>&1 && \
+     curl -ksS -m 2 -o /dev/null "https://$EFFECTIVE_BIND/" >/dev/null 2>&1; then
+    printf '   HTTPS:           WRN unexpected TLS listener; use http://my.space/ explicitly\n'
+  else
+    printf '   HTTPS:           --  not configured; HTTPS cannot redirect before a TLS handshake, use http://my.space/\n'
+  fi
+
   if command -v nft >/dev/null 2>&1 && nft list table inet space_link >/dev/null 2>&1; then
     dnst=$(uci -q get space-link.tproxy.dns_tunnel 2>/dev/null || echo 0)
     quic=$(uci -q get space-link.tproxy.block_quic 2>/dev/null || echo 0)
@@ -1405,9 +1501,9 @@ configure_panel_ip
 install_templates
 save_state
 configure_tproxy
+install_panel_watchdog
 enable_services
 configure_dns
 configure_protected_dns
-install_panel_watchdog
 install_cron
 final_summary

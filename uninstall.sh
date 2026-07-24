@@ -5,6 +5,14 @@ set -eu
 STATE_DIR="/etc/space-link"
 INSTALL_DIR="/opt/space-link"
 
+cleanup_cron_file() {
+  cron_file="$1"
+  [ -f "$cron_file" ] || return 0
+  sed -i '/space-link/d' "$cron_file"
+}
+
+# ---- main ---------------------------------------------------------------
+
 if [ -x /usr/bin/space-link-dns ]; then
   /usr/bin/space-link-dns purge >/dev/null 2>&1 || true
 fi
@@ -26,6 +34,7 @@ rm -rf /etc/sing-box 2>/dev/null || true
 rm -rf /etc/xray 2>/dev/null || true
 rm -f /usr/bin/geoip.dat /usr/bin/geosite.dat 2>/dev/null || true
 rm -f /usr/bin/space-link-dns 2>/dev/null || true
+rm -f /usr/bin/space-link-panel-watchdog 2>/dev/null || true
 rm -rf "$INSTALL_DIR"
 
 # Сохраняем токен по умолчанию — позволяет переустановку без повторного ввода.
@@ -86,6 +95,10 @@ if [ -f /etc/dnsmasq.conf ]; then
   sed -i '/^address=\/my\.sapce\//d' /etc/dnsmasq.conf 2>/dev/null || true
   sed -i '/^address=\/my\.spacelink\//d' /etc/dnsmasq.conf 2>/dev/null || true
   sed -i '/^address=\/spacelink\.lan\//d' /etc/dnsmasq.conf 2>/dev/null || true
+  sed -i '/^local=\/my\.space\//d' /etc/dnsmasq.conf 2>/dev/null || true
+  sed -i '/^local=\/my\.sapce\//d' /etc/dnsmasq.conf 2>/dev/null || true
+  sed -i '/^local=\/my\.spacelink\//d' /etc/dnsmasq.conf 2>/dev/null || true
+  sed -i '/^local=\/spacelink\.lan\//d' /etc/dnsmasq.conf 2>/dev/null || true
 fi
 /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
 
@@ -103,9 +116,8 @@ printf '==> Поднимаю uhttpd (LuCI), если был выключен\n'
 /etc/init.d/uhttpd start  >/dev/null 2>&1 || true
 
 printf '==> Чищу cron\n'
-if command -v crontab >/dev/null 2>&1; then
-  crontab -l 2>/dev/null | grep -v 'space-link' | crontab - 2>/dev/null || true
-fi
+cleanup_cron_file "${CRONTAB_FILE:-/etc/crontabs/root}" 2>/dev/null || true
+/etc/init.d/cron restart >/dev/null 2>&1 || true
 
 /etc/init.d/lighttpd restart >/dev/null 2>&1 || true
 printf 'OK  Space Link удалён\n'
