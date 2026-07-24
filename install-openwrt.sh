@@ -601,6 +601,25 @@ fallback_to_router_ip() {
   /etc/init.d/uhttpd disable >/dev/null 2>&1 || true
 }
 
+disarm_traffic_path() {
+  # Remove the old unconditional hotplug first. Otherwise a firewall reload
+  # during package installation can recreate the table after we stop it.
+  rm -f /etc/hotplug.d/firewall/99-space-link-tproxy 2>/dev/null || true
+  rm -f /etc/space-link/tproxy.armed 2>/dev/null || true
+  if [ -x /usr/bin/space-link-dns ]; then
+    /usr/bin/space-link-dns disable >/dev/null 2>&1 || true
+  fi
+  if [ -x /etc/init.d/space-link-tproxy ]; then
+    /etc/init.d/space-link-tproxy stop >/dev/null 2>&1 || true
+    /etc/init.d/space-link-tproxy disable >/dev/null 2>&1 || true
+  fi
+  nft delete table inet space_link >/dev/null 2>&1 || true
+  ip rule del fwmark 0xff >/dev/null 2>&1 || true
+  ip -6 rule del fwmark 0xff >/dev/null 2>&1 || true
+  ip route flush table 100 >/dev/null 2>&1 || true
+  ip -6 route flush table 100 >/dev/null 2>&1 || true
+}
+
 # ---- transparent proxy -----------------------------------------------------
 # Поднимаем TPROXY: маркируем LAN-трафик через nftables, заворачиваем по
 # fwmark в отдельную routing-таблицу с local-route на lo, где sing-box ловит его
@@ -617,6 +636,7 @@ fallback_to_router_ip() {
 # обратно после каждого fw4 reload, который мог снести её.
 configure_tproxy() {
   step "Настройка прозрачного проксирования (TPROXY)"
+  disarm_traffic_path
   TPROXY_PORT="${TPROXY_PORT:-12345}"
   TPROXY_MARK="${TPROXY_MARK:-255}"
   TPROXY_TABLE="${TPROXY_TABLE:-100}"
@@ -782,15 +802,38 @@ NFT
 START=99
 STOP=10
 
+clear_path() {
+  nft delete table inet space_link 2>/dev/null
+  ip rule del fwmark __MARK__ table __TABLE__ 2>/dev/null
+  ip route flush table __TABLE__ 2>/dev/null
+  ip -6 rule del fwmark __MARK__ table __TABLE__ 2>/dev/null
+  ip -6 route flush table __TABLE__ 2>/dev/null
+}
+
+engine_ready() {
+  pgrep -x sing-box >/dev/null 2>&1 || return 1
+  command -v netstat >/dev/null 2>&1 || return 1
+  netstat -ln 2>/dev/null | grep -Eq '[:.]12345[[:space:]]'
+}
+
 apply() {
-  nft -f /etc/space-link/tproxy.nft 2>&1 | logger -t space-link-tproxy
-  # IPv4 fwmark → отдельная таблица с local-route на lo (tproxy ловит на :port).
+  # The persistent marker records desired state, but a procd process can exist
+  # before its listener is ready. Both conditions are required on every start
+  # and firewall reload.
+  if [ ! -f /etc/space-link/tproxy.armed ] || ! engine_ready; then
+    clear_path
+    return 1
+  fi
+  if ! nft_output=$(nft -f /etc/space-link/tproxy.nft 2>&1); then
+    printf '%s\n' "$nft_output" | logger -t space-link-tproxy
+    clear_path
+    return 1
+  fi
+  [ -z "$nft_output" ] || printf '%s\n' "$nft_output" | logger -t space-link-tproxy
   ip rule del fwmark __MARK__ table __TABLE__ 2>/dev/null
   ip rule add fwmark __MARK__ table __TABLE__ 2>/dev/null
   ip route flush table __TABLE__ 2>/dev/null
   ip route add local 0.0.0.0/0 dev lo table __TABLE__ 2>/dev/null
-  # IPv6 симметрично — закрывает v6-leak (нужно вместе с ip6 daddr-исключениями
-  # и парным `tproxy ip6` правилом в nft). del перед add — идемпотентность.
   ip -6 rule del fwmark __MARK__ table __TABLE__ 2>/dev/null
   ip -6 rule add fwmark __MARK__ table __TABLE__ 2>/dev/null
   ip -6 route flush table __TABLE__ 2>/dev/null
@@ -798,13 +841,7 @@ apply() {
 }
 
 start() { apply; }
-stop() {
-  nft delete table inet space_link 2>/dev/null
-  ip rule del fwmark __MARK__ table __TABLE__ 2>/dev/null
-  ip route flush table __TABLE__ 2>/dev/null
-  ip -6 rule del fwmark __MARK__ table __TABLE__ 2>/dev/null
-  ip -6 route flush table __TABLE__ 2>/dev/null
-}
+stop() { clear_path; }
 reload() { apply; }
 INITD
   sed -i "s/__MARK__/$TPROXY_MARK/g; s/__TABLE__/$TPROXY_TABLE/g" /etc/init.d/space-link-tproxy
@@ -815,35 +852,96 @@ INITD
   mkdir -p /etc/hotplug.d/firewall 2>/dev/null || true
   cat > /etc/hotplug.d/firewall/99-space-link-tproxy <<'HOOK'
 #!/bin/sh
-# fw4 reload может снести нашу table inet space_link — переподнимаем.
-/etc/init.d/space-link-tproxy reload 2>/dev/null
+# fw4 reload may remove the standalone table. Restore it only while the
+# health-gated path is armed and the destination listener still exists.
+if [ -f /etc/space-link/tproxy.armed ] && pgrep -x sing-box >/dev/null 2>&1; then
+  /etc/init.d/space-link-tproxy reload >/dev/null 2>&1 || /etc/init.d/space-link-tproxy stop >/dev/null 2>&1
+else
+  /etc/init.d/space-link-tproxy stop >/dev/null 2>&1
+fi
 HOOK
   chmod 0755 /etc/hotplug.d/firewall/99-space-link-tproxy
 
   # 7) Снять старый iface-hotplug от v0.1.13, если остался.
   rm -f /etc/hotplug.d/iface/99-space-link-tproxy 2>/dev/null || true
 
-  # 8) Enable + start.
+  # Install and enable the service, but do not intercept anything yet.
+  # activate_traffic_path performs the engine/config/listener health gate.
   /etc/init.d/space-link-tproxy enable 2>/dev/null || true
-  /etc/init.d/space-link-tproxy start 2>/dev/null || true
+  ok "TPROXY настроен и ожидает проверку sing-box"
+}
 
-  # 9) Verify.
-  sleep 1
-  if nft list table inet space_link >/dev/null 2>&1; then
-    ok "TPROXY активен (table inet space_link, port=$TPROXY_PORT, mark=$TPROXY_MARK, table=$TPROXY_TABLE)"
-    # Диагностика двойного стека + тумблеров.
-    if ip -6 rule show 2>/dev/null | grep -q "fwmark $(printf '0x%x' "$TPROXY_MARK" 2>/dev/null || echo "$TPROXY_MARK")\|fwmark $TPROXY_MARK"; then
-      ok "  IPv6 fwmark-rule активен (v6-leak закрыт)"
-    else
-      warn "  IPv6 fwmark-rule не виден — на роутере без IPv6 это норма"
-    fi
-    [ "$DNS_TUNNEL" = "1" ] && ok "  DNS-tunnel: ВКЛ (весь :53 из LAN → туннель)" \
-                           || ok "  DNS-tunnel: ВЫКЛ (uci set space-link.tproxy.dns_tunnel=1)"
-    [ "$BLOCK_QUIC" = "1" ] && ok "  QUIC-block: ВКЛ (UDP/443 режется → TCP-fallback; выключить: uci set space-link.tproxy.block_quic=0)" \
-                            || ok "  QUIC-block: ВЫКЛ (включить: uci set space-link.tproxy.block_quic=1)"
-  else
-    warn "TPROXY не применился — посмотри: logread -t space-link-tproxy"
+# The active config must be valid, the process stable, and the transparent
+# listener present before LAN interception can be armed.
+traffic_engine_ready() {
+  [ -s /etc/space-link/active-server ] || return 1
+  if [ -x /usr/bin/sing-box ]; then
+    /usr/bin/sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1 || return 1
   fi
+  pgrep -x sing-box >/dev/null 2>&1 || return 1
+  command -v netstat >/dev/null 2>&1 || return 1
+  netstat -ln 2>/dev/null | grep -Eq '[:.]12345[[:space:]]' || return 1
+}
+
+activate_traffic_path() {
+  step "Проверка и включение прозрачного проксирования"
+  # enable_services starts the API, whose startup reconciliation may already
+  # have completed the same health-gated activation. Preserve that healthy
+  # path instead of introducing a second stop/start protection gap.
+  if [ -f /etc/space-link/tproxy.armed ] \
+     && traffic_engine_ready \
+     && nft list table inet space_link >/dev/null 2>&1; then
+    ok "TPROXY уже активен и прошёл проверку"
+    return 0
+  fi
+
+  rm -f /etc/space-link/tproxy.armed 2>/dev/null || true
+  /etc/init.d/space-link-tproxy stop >/dev/null 2>&1 || true
+  if [ ! -s /etc/space-link/active-server ]; then
+    /etc/init.d/space-link-tproxy disable >/dev/null 2>&1 || true
+    if [ -x /usr/bin/space-link-dns ]; then
+      /usr/bin/space-link-dns disable >/dev/null 2>&1 || true
+    fi
+    ok "сервер не выбран — интернет оставлен напрямую"
+    return 0
+  fi
+
+  retries="${TRAFFIC_READY_RETRIES:-5}"
+  ready=0
+  i=1
+  while [ "$i" -le "$retries" ]; do
+    if traffic_engine_ready; then
+      ready=1
+      break
+    fi
+    i=$((i + 1))
+    sleep 1
+  done
+
+  if [ "$ready" != "1" ]; then
+    /etc/init.d/space-link-tproxy disable >/dev/null 2>&1 || true
+    if [ -x /usr/bin/space-link-dns ]; then
+      /usr/bin/space-link-dns disable >/dev/null 2>&1 || true
+    fi
+    warn "sing-box или :12345 не готовы — TPROXY выключен, интернет оставлен напрямую"
+    return 0
+  fi
+
+  touch /etc/space-link/tproxy.armed
+  /etc/init.d/space-link-tproxy enable >/dev/null 2>&1 || true
+  if /etc/init.d/space-link-tproxy start >/dev/null 2>&1 \
+     && nft list table inet space_link >/dev/null 2>&1; then
+    ok "TPROXY активирован после проверки sing-box"
+    return 0
+  fi
+
+  rm -f /etc/space-link/tproxy.armed 2>/dev/null || true
+  /etc/init.d/space-link-tproxy stop >/dev/null 2>&1 || true
+  /etc/init.d/space-link-tproxy disable >/dev/null 2>&1 || true
+  if [ -x /usr/bin/space-link-dns ]; then
+    /usr/bin/space-link-dns disable >/dev/null 2>&1 || true
+  fi
+  warn "TPROXY не применился — интернет оставлен напрямую"
 }
 
 # ---- enable services -------------------------------------------------------
@@ -1489,6 +1587,9 @@ preflight
 # Снапшот рабочих конфигов ДО любых правок — для отката если что-то пойдёт не так.
 mkdir -p "$BACKUP_DIR" 2>/dev/null || true
 backup_uci_state
+# Package upgrades may restart sing-box. Remove interception before touching
+# packages so LAN remains on direct WAN throughout the entire update window.
+disarm_traffic_path
 # Если dnsmasq уже лежит от прошлой кривой установки или ручных правок — чиним.
 ensure_dnsmasq_alive
 prompt_token
@@ -1505,5 +1606,6 @@ install_panel_watchdog
 enable_services
 configure_dns
 configure_protected_dns
+activate_traffic_path
 install_cron
 final_summary
