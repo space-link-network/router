@@ -18,6 +18,8 @@ if [ -x /usr/bin/space-link-dns ]; then
 fi
 
 printf '==> Останавливаю сервисы\n'
+/etc/init.d/space-link-update-guard stop 2>/dev/null || true
+/etc/init.d/space-link-update-guard disable 2>/dev/null || true
 /etc/init.d/space-link stop 2>/dev/null || true
 /etc/init.d/space-link disable 2>/dev/null || true
 # VPN-движок (с v0.2.0 — sing-box). Сам пакет оставляем установленным, чтобы
@@ -35,6 +37,11 @@ rm -rf /etc/xray 2>/dev/null || true
 rm -f /usr/bin/geoip.dat /usr/bin/geosite.dat 2>/dev/null || true
 rm -f /usr/bin/space-link-dns 2>/dev/null || true
 rm -f /usr/bin/space-link-panel-watchdog 2>/dev/null || true
+rm -f /usr/bin/space-link-update-guard 2>/dev/null || true
+rm -f /etc/init.d/space-link-update-guard 2>/dev/null || true
+rm -f /etc/hotplug.d/iface/99-space-link-panel-ip 2>/dev/null || true
+rm -rf /opt/space-link.previous /opt/.space-link-candidate.* 2>/dev/null || true
+rm -rf "$STATE_DIR/update" 2>/dev/null || true
 rm -rf "$INSTALL_DIR"
 
 # Сохраняем токен по умолчанию — позволяет переустановку без повторного ввода.
@@ -103,11 +110,11 @@ fi
 /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
 
 printf '==> Снимаю alias-IP панели (network.lan_panel)\n'
+ip addr del 192.168.1.2/24 dev br-lan 2>/dev/null || true
 if command -v uci >/dev/null 2>&1; then
   if uci -q get network.lan_panel >/dev/null 2>&1; then
     uci -q delete network.lan_panel >/dev/null 2>&1 || true
     uci -q commit network >/dev/null 2>&1 || true
-    service network reload >/dev/null 2>&1 || /etc/init.d/network reload >/dev/null 2>&1 || true
   fi
 fi
 

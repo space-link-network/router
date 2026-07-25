@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.31"
+VERSION="0.3.32"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -18,6 +18,24 @@ INSTALL_TMP_DIR="${INSTALL_TMP_DIR:-/tmp}"
 ENGINE_LOCK_DIR="${SPACE_LINK_ENGINE_LOCK:-/tmp/space-link-engine.lock}"
 ENGINE_LOCK_RETRIES="${SPACE_LINK_ENGINE_LOCK_RETRIES:-30}"
 ENGINE_LOCK_HELD=0
+ACTIVE_INSTALL_DIR="$INSTALL_DIR"
+PREVIOUS_INSTALL_DIR="${PREVIOUS_INSTALL_DIR:-/opt/space-link.previous}"
+CANDIDATE_DIR="${CANDIDATE_DIR:-/opt/.space-link-candidate.$$}"
+UPDATE_DIR="${SPACE_LINK_UPDATE_DIR:-$STATE_DIR/update}"
+UPDATE_TX_ACTIVE=0
+UPDATE_GUARD_STARTED=0
+UPDATE_ROOT="${SPACE_LINK_UPDATE_ROOT:-}"
+UPDATE_MODE=0
+UPDATE_TX_PREPARED=0
+INSTALL_SUCCESS=0
+PREVIOUS_VERSION="unknown"
+PREVIOUS_SPACE_LINK_ENABLED=0
+PREVIOUS_SPACE_LINK_RUNNING=1
+PREVIOUS_SINGBOX_ENABLED=0
+PREVIOUS_SINGBOX_RUNNING=0
+PREVIOUS_LIGHTTPD_ENABLED=0
+PREVIOUS_LIGHTTPD_RUNNING=0
+PREVIOUS_TPROXY_ARMED=0
 
 # Где живёт наша панель. По умолчанию — alias-IP на LAN-интерфейсе чтобы
 # не конфликтовать с uhttpd (LuCI). Если alias не поднимется, упадём в
@@ -228,9 +246,15 @@ release_engine_lock() {
 }
 
 installer_exit() {
-  [ "$ENGINE_LOCK_HELD" = "1" ] || return 0
+  exit_status=$?
+  [ "$ENGINE_LOCK_HELD" = "1" ] || return "$exit_status"
+  if [ "$UPDATE_TX_PREPARED" = "1" ] \
+     && { [ "$exit_status" != "0" ] || [ "$INSTALL_SUCCESS" != "1" ]; }; then
+    rollback_installer_transaction
+  fi
   cleanup_install_artifacts
   release_engine_lock
+  return "$exit_status"
 }
 
 backup_uci_state() {
@@ -523,6 +547,245 @@ fetch() {
   fi
 }
 
+set_install_target() {
+  INSTALL_DIR="$1"
+  WWW_DIR="$INSTALL_DIR/www"
+  RULES_DIR="$INSTALL_DIR/rules"
+  BIN_PATH="$INSTALL_DIR/space-link-api"
+}
+
+validate_candidate_runtime() {
+  candidate="$1"
+  [ -s "$candidate/space-link-api" ] || return 1
+  [ -f "$candidate/www/index.html" ] || return 1
+  [ -s "$candidate/rules/presets/ru.txt" ] || return 1
+}
+
+activate_candidate_runtime() {
+  validate_candidate_runtime "$CANDIDATE_DIR" \
+    || die "Новая сборка неполная — текущая версия оставлена без изменений"
+
+  rm -rf "$PREVIOUS_INSTALL_DIR" 2>/dev/null || true
+  if [ -e "$ACTIVE_INSTALL_DIR" ]; then
+    mv "$ACTIVE_INSTALL_DIR" "$PREVIOUS_INSTALL_DIR" \
+      || die "Не удалось сохранить предыдущую версию"
+  fi
+  if ! mv "$CANDIDATE_DIR" "$ACTIVE_INSTALL_DIR"; then
+    [ -e "$PREVIOUS_INSTALL_DIR" ] && mv "$PREVIOUS_INSTALL_DIR" "$ACTIVE_INSTALL_DIR" 2>/dev/null || true
+    die "Не удалось атомарно активировать новую версию"
+  fi
+  set_install_target "$ACTIVE_INSTALL_DIR"
+  UPDATE_TX_ACTIVE=1
+}
+
+update_root_path() {
+  printf '%s/%s\n' "$UPDATE_ROOT" "$1"
+}
+
+prepare_candidate_runtime() {
+  UPDATE_MODE=1
+  rm -rf "$CANDIDATE_DIR" 2>/dev/null || true
+  mkdir -p "$(dirname "$CANDIDATE_DIR")"
+  if [ -d "$ACTIVE_INSTALL_DIR" ]; then
+    cp -a "$ACTIVE_INSTALL_DIR" "$CANDIDATE_DIR" \
+      || die "Не удалось подготовить изолированную копию текущей версии"
+  else
+    mkdir -p "$CANDIDATE_DIR"
+  fi
+  set_install_target "$CANDIDATE_DIR"
+}
+
+update_managed_paths() {
+  cat <<'EOF'
+etc/config/dhcp
+etc/config/network
+etc/config/firewall
+etc/config/wireless
+etc/config/uhttpd
+etc/config/sing-box
+etc/config/space-link
+etc/lighttpd/conf.d/space-link.conf
+etc/init.d/space-link
+etc/init.d/space-link-dns
+etc/init.d/space-link-tproxy
+etc/init.d/space-link-update-guard
+usr/bin/space-link-dns
+usr/bin/space-link-panel-watchdog
+usr/bin/space-link-update-guard
+etc/hotplug.d/iface/99-space-link-panel-ip
+etc/crontabs/root
+etc/space-link/version
+etc/space-link/tproxy.nft
+etc/space-link/tproxy.armed
+EOF
+}
+
+service_was_enabled() {
+  service="$1"
+  rc_dir=$(update_root_path etc/rc.d)
+  for link in "$rc_dir"/S??"$service"; do
+    [ -L "$link" ] && return 0
+  done
+  return 1
+}
+
+service_was_running() {
+  init=$(update_root_path "etc/init.d/$1")
+  [ -x "$init" ] || return 1
+  "$init" status 2>/dev/null | grep -q running
+}
+
+snapshot_update_state() {
+  [ "$UPDATE_MODE" = "1" ] || return 0
+  [ ! -e "$UPDATE_DIR/pending" ] \
+    || die "Предыдущее обновление ещё проходит проверку. Повтори через 10 минут."
+
+  PREVIOUS_VERSION=$(cat "$(update_root_path etc/space-link/version)" 2>/dev/null || echo unknown)
+  service_was_enabled space-link && PREVIOUS_SPACE_LINK_ENABLED=1 || PREVIOUS_SPACE_LINK_ENABLED=0
+  service_was_running space-link && PREVIOUS_SPACE_LINK_RUNNING=1 || PREVIOUS_SPACE_LINK_RUNNING=0
+  service_was_enabled sing-box && PREVIOUS_SINGBOX_ENABLED=1 || PREVIOUS_SINGBOX_ENABLED=0
+  service_was_running sing-box && PREVIOUS_SINGBOX_RUNNING=1 || PREVIOUS_SINGBOX_RUNNING=0
+  service_was_enabled lighttpd && PREVIOUS_LIGHTTPD_ENABLED=1 || PREVIOUS_LIGHTTPD_ENABLED=0
+  service_was_running lighttpd && PREVIOUS_LIGHTTPD_RUNNING=1 || PREVIOUS_LIGHTTPD_RUNNING=0
+  [ -e "$(update_root_path etc/space-link/tproxy.armed)" ] \
+    && PREVIOUS_TPROXY_ARMED=1 || PREVIOUS_TPROXY_ARMED=0
+  EXPECT_WIFI=0
+  if [ -z "$UPDATE_ROOT" ] && wifi status 2>/dev/null | grep -q '"up"[[:space:]]*:[[:space:]]*true'; then
+    EXPECT_WIFI=1
+  fi
+
+  rm -rf "$UPDATE_DIR"
+  mkdir -p "$UPDATE_DIR/snapshot"
+  update_managed_paths > "$UPDATE_DIR/managed-files"
+  while IFS= read -r relative; do
+    [ -n "$relative" ] || continue
+    source_path=$(update_root_path "$relative")
+    [ -e "$source_path" ] || [ -L "$source_path" ] || continue
+    snapshot_path="$UPDATE_DIR/snapshot/$relative"
+    mkdir -p "$(dirname "$snapshot_path")"
+    cp -a "$source_path" "$snapshot_path" \
+      || die "Не удалось сохранить системный файл $relative для отката"
+  done < "$UPDATE_DIR/managed-files"
+  UPDATE_TX_PREPARED=1
+}
+
+restore_update_snapshot() {
+  [ -r "$UPDATE_DIR/managed-files" ] || return 0
+  while IFS= read -r relative; do
+    [ -n "$relative" ] || continue
+    case "$relative" in
+      /*|*'..'*) return 1 ;;
+    esac
+    target=$(update_root_path "$relative")
+    snapshot="$UPDATE_DIR/snapshot/$relative"
+    rm -rf "$target" 2>/dev/null || true
+    if [ -e "$snapshot" ] || [ -L "$snapshot" ]; then
+      mkdir -p "$(dirname "$target")"
+      cp -a "$snapshot" "$target" || return 1
+    fi
+  done < "$UPDATE_DIR/managed-files"
+}
+
+install_update_guard() {
+  guard_bin=$(update_root_path usr/bin/space-link-update-guard)
+  guard_init=$(update_root_path etc/init.d/space-link-update-guard)
+  mkdir -p "$(dirname "$guard_bin")" "$(dirname "$guard_init")"
+  if [ -f "$SCRIPT_DIR/../templates/space-link-update-guard" ]; then
+    cp "$SCRIPT_DIR/../templates/space-link-update-guard" "$guard_bin"
+    cp "$SCRIPT_DIR/../templates/space-link-update-guard.init" "$guard_init"
+  else
+    fetch "$RELEASE_BASE/space-link-update-guard" "$guard_bin" \
+      || die "Не удалось скачать независимый guard обновлений"
+    fetch "$RELEASE_BASE/space-link-update-guard.init" "$guard_init" \
+      || die "Не удалось скачать procd-сервис guard обновлений"
+  fi
+  chmod 0755 "$guard_bin" "$guard_init"
+  if [ -z "$UPDATE_ROOT" ]; then
+    "$guard_init" enable >/dev/null 2>&1 \
+      || die "Не удалось включить независимый guard обновлений"
+  fi
+}
+
+write_update_pending() {
+  mkdir -p "$UPDATE_DIR"
+  pending_tmp="$UPDATE_DIR/pending.tmp.$$"
+  cat > "$pending_tmp" <<EOF
+candidate_version=$VERSION
+previous_version=$PREVIOUS_VERSION
+healthy_checks=0
+failed_checks=0
+expect_wifi=${EXPECT_WIFI:-0}
+previous_space_link_enabled=$PREVIOUS_SPACE_LINK_ENABLED
+previous_space_link_running=$PREVIOUS_SPACE_LINK_RUNNING
+previous_singbox_enabled=$PREVIOUS_SINGBOX_ENABLED
+previous_singbox_running=$PREVIOUS_SINGBOX_RUNNING
+previous_lighttpd_enabled=$PREVIOUS_LIGHTTPD_ENABLED
+previous_lighttpd_running=$PREVIOUS_LIGHTTPD_RUNNING
+previous_tproxy_armed=$PREVIOUS_TPROXY_ARMED
+EOF
+  chmod 0600 "$pending_tmp" 2>/dev/null || true
+  mv "$pending_tmp" "$UPDATE_DIR/pending"
+}
+
+begin_update_transaction() {
+  [ "$UPDATE_MODE" = "1" ] || return 0
+  validate_candidate_runtime "$CANDIDATE_DIR" \
+    || die "Новая сборка неполная — текущая версия оставлена без изменений"
+  [ "$UPDATE_TX_PREPARED" = "1" ] || snapshot_update_state
+  install_update_guard
+  write_update_pending
+  activate_candidate_runtime
+}
+
+start_update_guard() {
+  [ "$UPDATE_MODE" = "1" ] || return 0
+  guard_init=$(update_root_path etc/init.d/space-link-update-guard)
+  if [ -z "$UPDATE_ROOT" ] && [ -x "$guard_init" ]; then
+    "$guard_init" restart >/dev/null 2>&1 \
+      || "$guard_init" start >/dev/null 2>&1 \
+      || die "Не удалось запустить независимый guard обновлений"
+    guard_running=0
+    for _ in 1 2 3 4 5; do
+      if "$guard_init" status 2>/dev/null | grep -q running; then
+        guard_running=1
+        break
+      fi
+      sleep 1
+    done
+    [ "$guard_running" = "1" ] \
+      || die "Guard обновлений не запустился — возвращаю предыдущую версию"
+  fi
+  UPDATE_GUARD_STARTED=1
+}
+restore_pre_activation_services() {
+  dnsmasq_init=$(update_root_path etc/init.d/dnsmasq)
+  [ -x "$dnsmasq_init" ] && "$dnsmasq_init" restart >/dev/null 2>&1 || true
+  if [ "$PREVIOUS_TPROXY_ARMED" = "1" ]; then
+    tproxy_init=$(update_root_path etc/init.d/space-link-tproxy)
+    [ -x "$tproxy_init" ] && "$tproxy_init" start >/dev/null 2>&1 || true
+  fi
+}
+
+
+rollback_installer_transaction() {
+  [ "$UPDATE_TX_PREPARED" = "1" ] || return 0
+  guard_bin=$(update_root_path usr/bin/space-link-update-guard)
+  if [ "$UPDATE_TX_ACTIVE" = "1" ] && [ -x "$guard_bin" ] && [ -f "$UPDATE_DIR/pending" ]; then
+    SL_ROOT="$UPDATE_ROOT" \
+    SL_ACTIVE_DIR="$ACTIVE_INSTALL_DIR" \
+    SL_PREVIOUS_DIR="$PREVIOUS_INSTALL_DIR" \
+    SL_UPDATE_DIR="$UPDATE_DIR" \
+      "$guard_bin" rollback || warn "Автоматический откат завершился с ошибкой"
+  else
+    restore_update_snapshot || warn "Не удалось полностью восстановить системные конфиги"
+    rm -f "$UPDATE_DIR/pending" 2>/dev/null || true
+    rm -rf "$CANDIDATE_DIR" 2>/dev/null || true
+    restore_pre_activation_services
+  fi
+  UPDATE_TX_ACTIVE=0
+  UPDATE_TX_PREPARED=0
+}
+
 install_binary() {
   step "Загрузка space-link-api ($ARCH)"
   mkdir -p "$INSTALL_DIR"
@@ -613,13 +876,12 @@ install_templates() {
 # выключаем uhttpd, занимаем :80 на основном IP роутера. EFFECTIVE_BIND и
 # EFFECTIVE_PORT в конце отражают реальное место панели.
 configure_panel_ip() {
-  # uci get может вернуть "192.168.1.1/24" (если уже list) или несколько
-  # адресов через пробел — берём первый и отрезаем маску. Это и есть
-  # настоящий primary-IP роутера, без артефактов прошлых установок.
+  # Keep the router's primary LAN configuration byte-for-byte intact. A prior
+  # installer rewrote network.lan.ipaddr as a list and reloaded all of netifd;
+  # on real hardware that dropped Ethernet, Wi-Fi, and the SSH recovery path.
   ROUTER_IP_RAW=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
   ROUTER_IP=$(printf '%s\n' "$ROUTER_IP_RAW" | awk '{print $1}' | cut -d'/' -f1)
   [ -n "$ROUTER_IP" ] || ROUTER_IP="192.168.1.1"
-  ROUTER_MASK=$(uci -q get network.lan.netmask 2>/dev/null || echo "255.255.255.0")
 
   step "Доп. IP для панели: $PANEL_IP (основной: $ROUTER_IP)"
   if ! command -v uci >/dev/null 2>&1; then
@@ -628,38 +890,17 @@ configure_panel_ip() {
     return 0
   fi
 
-  # Удалим старый отдельный интерфейс lan_panel если был от v0.1.4-v0.1.7 —
-  # он на OpenWrt 25.x ломал основной IP. Переходим на secondary list ipaddr.
+  # Remove only the obsolete standalone interface. Never rewrite lan.ipaddr
+  # and never reload network during an application update.
   if uci -q get network.lan_panel >/dev/null 2>&1; then
     uci -q delete network.lan_panel
+    uci commit network
   fi
 
-  # Перезаписываем list ipaddr с нуля: основной IP + наш panel-IP, оба с /24.
-  # Старые значения (включая возможные дубли и битые) выбрасываем.
-  cidr_main="$ROUTER_IP/24"
-  cidr_panel="$PANEL_IP/24"
-
-  # Перезаписываем целиком, чтобы убрать возможные дубли наших прошлых попыток.
-  uci -q delete network.lan.ipaddr 2>/dev/null || true
-  uci add_list network.lan.ipaddr="$cidr_main"
-  uci add_list network.lan.ipaddr="$cidr_panel"
-  uci commit network
-
-  # Reload сети — нативный путь, в одном интерфейсе оба IP не теряются.
-  service network reload >/dev/null 2>&1 || /etc/init.d/network reload >/dev/null 2>&1 || true
-  sleep 3
-
-  # Verify: основной IP жив И PANEL_IP появился.
   main_present=0
   alias_present=0
   ip addr show br-lan 2>/dev/null | grep -q "inet $ROUTER_IP/" && main_present=1
   ip addr show br-lan 2>/dev/null | grep -q "inet $PANEL_IP/" && alias_present=1
-
-  # Подстраховка: если reload не поднял secondary-IP (частая причина «сайт/домен
-  # не открывается на первой установке» — на интерфейсе оказался один адрес
-  # вместо двух) — добавляем его напрямую. ip addr add НЕ рвёт соединение (в
-  # отличие от полного restart сети, что убило бы SSH-сессию установки), а
-  # uci-конфиг с двумя ipaddr уже закоммичен выше, так что адрес переживёт reboot.
   if [ "$alias_present" != "1" ]; then
     ip addr add "$PANEL_IP/24" dev br-lan 2>/dev/null || true
     sleep 1
@@ -670,11 +911,23 @@ configure_panel_ip() {
   if [ "$main_present" = "1" ] && [ "$alias_present" = "1" ]; then
     EFFECTIVE_BIND="$PANEL_IP"
     EFFECTIVE_PORT="$PANEL_PORT"
-    ok "доп. IP $PANEL_IP/24 на br-lan, основной $ROUTER_IP жив — LuCI и панель параллельно"
-    # Прибиваем uhttpd явно к ROUTER_IP, без 0.0.0.0-wildcard. Без этого
-    # uhttpd при следующем boot стартует первым и забирает 0.0.0.0:80 на
-    # всех интерфейсах включая PANEL_IP — наш lighttpd падает на
-    # "Address already in use" и панель пропадает после reboot.
+
+    # Persist the runtime alias without changing the LAN UCI package. netifd
+    # invokes this after future LAN ifup events and the panel watchdog provides
+    # a second non-disruptive repair path.
+    panel_hotplug="${PANEL_HOTPLUG_PATH:-/etc/hotplug.d/iface/99-space-link-panel-ip}"
+    mkdir -p "$(dirname "$panel_hotplug")"
+    cat > "$panel_hotplug" <<'HOOK'
+#!/bin/sh
+[ "${ACTION:-}" = "ifup" ] || exit 0
+[ "${INTERFACE:-}" = "lan" ] || exit 0
+ip addr show br-lan 2>/dev/null | grep -q "inet __PANEL_IP__/" \
+  || ip addr add "__PANEL_IP__/24" dev br-lan 2>/dev/null || true
+HOOK
+    sed -i "s/__PANEL_IP__/$PANEL_IP/g" "$panel_hotplug"
+    chmod 0755 "$panel_hotplug"
+
+    ok "доп. IP $PANEL_IP/24 добавлен без перезапуска сети; основной $ROUTER_IP сохранён"
     uci -q delete uhttpd.main.listen_http  >/dev/null 2>&1 || true
     uci -q delete uhttpd.main.listen_https >/dev/null 2>&1 || true
     uci add_list uhttpd.main.listen_http="$ROUTER_IP:80"   >/dev/null 2>&1 || true
@@ -692,10 +945,7 @@ configure_panel_ip() {
     return 0
   fi
 
-  warn "secondary IP не встал (main=$main_present alias=$alias_present) — откатываю"
-  rollback_uci network >/dev/null 2>&1 || true
-  service network reload >/dev/null 2>&1 || /etc/init.d/network reload >/dev/null 2>&1 || true
-  sleep 3
+  warn "secondary IP не встал (main=$main_present alias=$alias_present) — использую основной IP без reload сети"
   fallback_to_router_ip
 }
 
@@ -1404,16 +1654,9 @@ restart_service() {
   svc="$1"
   reason="$2"
   log "$svc unhealthy: $reason; restarting"
-  /etc/init.d/"$svc" enable >/dev/null 2>&1 || true
   /etc/init.d/"$svc" restart >/dev/null 2>&1 || /etc/init.d/"$svc" start >/dev/null 2>&1 || true
 }
 
-api_url="http://127.0.0.1:8080/api/local/health"
-if ! http_ok "$api_url"; then
-  restart_service space-link "api health failed"
-  sleep 3
-  http_ok "$api_url" || log "space-link-api still unhealthy after restart"
-fi
 
 conf="/etc/lighttpd/conf.d/space-link.conf"
 bind="$(awk -F'"' '/server.bind/ { print $2; exit }' "$conf" 2>/dev/null)"
@@ -1530,9 +1773,8 @@ WATCHDOG
 
 # ---- heartbeat cron --------------------------------------------------------
 install_cron() {
-  step "Установка cron для heartbeat/watchdog"
+  step "Установка cron для heartbeat"
   heartbeat_line="*/5 * * * * /usr/bin/wget -q -O- http://127.0.0.1:8080/api/local/status >/dev/null 2>&1 # space-link-heartbeat"
-  watchdog_line="* * * * * /usr/bin/space-link-panel-watchdog >/dev/null 2>&1 # space-link-panel-watchdog"
   cron_file="${CRONTAB_FILE:-/etc/crontabs/root}"
   cron_init="${CRON_INIT:-/etc/init.d/cron}"
   cron_tmp="/tmp/space-link-cron.$$"
@@ -1546,7 +1788,7 @@ install_cron() {
     fi
   } | grep -v '# space-link-heartbeat$' \
     | grep -v '# space-link-panel-watchdog$' > "$cron_tmp" || true
-  printf '%s\n%s\n' "$heartbeat_line" "$watchdog_line" >> "$cron_tmp"
+  printf '%s\n' "$heartbeat_line" >> "$cron_tmp"
 
   # Prefer the platform frontend, but never trust only its exit code. The
   # production failure that motivated this check returned success while the
@@ -1555,8 +1797,7 @@ install_cron() {
     crontab "$cron_tmp" >/dev/null 2>&1 || true
   fi
   cron_snapshot="$(crontab -l 2>/dev/null || cat "$cron_file" 2>/dev/null || true)"
-  if [ "$(printf '%s\n' "$cron_snapshot" | grep -Fxc "$heartbeat_line" || true)" != "1" ] \
-     || [ "$(printf '%s\n' "$cron_snapshot" | grep -Fxc "$watchdog_line" || true)" != "1" ]; then
+  if [ "$(printf '%s\n' "$cron_snapshot" | grep -Fxc "$heartbeat_line" || true)" != "1" ]; then
     cp "$cron_tmp" "$cron_file"
     chmod 0600 "$cron_file" 2>/dev/null || true
     cron_snapshot="$(cat "$cron_file" 2>/dev/null || true)"
@@ -1566,11 +1807,10 @@ install_cron() {
   "$cron_init" enable >/dev/null 2>&1 || true
   "$cron_init" restart >/dev/null 2>&1 || true
 
-  if [ "$(printf '%s\n' "$cron_snapshot" | grep -Fxc "$heartbeat_line" || true)" = "1" ] \
-     && [ "$(printf '%s\n' "$cron_snapshot" | grep -Fxc "$watchdog_line" || true)" = "1" ]; then
-    ok "cron: heartbeat + panel watchdog"
+  if [ "$(printf '%s\n' "$cron_snapshot" | grep -Fxc "$heartbeat_line" || true)" = "1" ]; then
+    ok "cron: heartbeat"
   else
-    warn "cron не сохранил watchdog; procd-supervisor остаётся активным"
+    warn "cron не сохранил heartbeat"
   fi
 }
 
@@ -1697,6 +1937,10 @@ printf '   Версия: %s   Режим: %s\n\n' "$VERSION" "$mode"
 preflight
 prompt_token
 acquire_engine_lock
+if [ -d "$ACTIVE_INSTALL_DIR" ]; then
+  prepare_candidate_runtime
+  snapshot_update_state
+fi
 # Снапшот рабочих конфигов ДО любых правок — для отката если что-то пойдёт не так.
 mkdir -p "$BACKUP_DIR" 2>/dev/null || true
 backup_uci_state
@@ -1710,7 +1954,9 @@ migrate_from_xray
 install_binary
 install_ui
 install_rules
+begin_update_transaction
 configure_panel_ip
+[ "$UPDATE_MODE" = "1" ] || install_update_guard
 install_templates
 save_state
 configure_tproxy
@@ -1720,4 +1966,6 @@ configure_dns
 configure_protected_dns
 activate_traffic_path
 install_cron
+start_update_guard
 final_summary
+INSTALL_SUCCESS=1
