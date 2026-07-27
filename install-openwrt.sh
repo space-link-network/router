@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.39"
+VERSION="0.3.40"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -22,6 +22,7 @@ ACTIVE_INSTALL_DIR="$INSTALL_DIR"
 PREVIOUS_INSTALL_DIR="${PREVIOUS_INSTALL_DIR:-/opt/space-link.previous}"
 CANDIDATE_DIR="${CANDIDATE_DIR:-/opt/.space-link-candidate.$$}"
 UPDATE_DIR="${SPACE_LINK_UPDATE_DIR:-$STATE_DIR/update}"
+UPDATE_PENDING_MAX_AGE="${SPACE_LINK_UPDATE_PENDING_MAX_AGE:-7200}"
 UPDATE_TX_ACTIVE=0
 UPDATE_GUARD_STARTED=0
 UPDATE_ROOT="${SPACE_LINK_UPDATE_ROOT:-}"
@@ -635,10 +636,100 @@ service_was_running() {
   "$init" status 2>/dev/null | grep -q running
 }
 
+update_pending_is_uint() {
+  case "${1:-}" in
+    ''|*[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+update_pending_mtime() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
+}
+
+clear_stuck_update_pending() {
+  reason="$1"
+  outcome="$2"
+  mkdir -p "$UPDATE_DIR"
+  printf '%s\n' "$outcome" > "$UPDATE_DIR/outcome"
+  rm -rf "$UPDATE_DIR/pending"
+  sync 2>/dev/null || true
+  case "$reason" in
+    malformed) warn "Состояние прошлого обновления повреждено. Начинаю новое обновление." ;;
+    stale) warn "Проверка прошлого обновления длилась слишком долго. Начинаю новое обновление." ;;
+  esac
+}
+
+# Return success only for a current, complete probation. The update guard owns
+# recovery after activation; this check only prevents an old state file from
+# making every later installation impossible.
+update_pending_is_running() {
+  pending_file="$UPDATE_DIR/pending"
+  [ -e "$pending_file" ] || return 1
+  if [ ! -f "$pending_file" ] || [ ! -r "$pending_file" ]; then
+    clear_stuck_update_pending malformed rollback-failed
+    return 1
+  fi
+
+  pending_candidate=""
+  pending_previous=""
+  pending_started_at=""
+  pending_valid=1
+  pending_candidate_seen=0
+  pending_previous_seen=0
+  pending_healthy_seen=0
+  pending_failed_seen=0
+
+  while IFS='=' read -r key value; do
+    case "$key" in
+      candidate_version)
+        if [ -n "$value" ]; then pending_candidate=$value; pending_candidate_seen=1; else pending_valid=0; fi
+        ;;
+      previous_version)
+        if [ -n "$value" ]; then pending_previous=$value; pending_previous_seen=1; else pending_valid=0; fi
+        ;;
+      healthy_checks)
+        if update_pending_is_uint "$value"; then pending_healthy_seen=1; else pending_valid=0; fi
+        ;;
+      failed_checks)
+        if update_pending_is_uint "$value"; then pending_failed_seen=1; else pending_valid=0; fi
+        ;;
+      grace_checks|expect_wifi|previous_space_link_enabled|previous_space_link_running|previous_singbox_enabled|previous_singbox_running|previous_lighttpd_enabled|previous_lighttpd_running|previous_tproxy_armed)
+        update_pending_is_uint "$value" || pending_valid=0
+        ;;
+      started_at)
+        if update_pending_is_uint "$value"; then pending_started_at=$value; else pending_valid=0; fi
+        ;;
+    esac
+  done < "$pending_file"
+
+  if [ "$pending_valid" != 1 ] || [ "$pending_candidate_seen" != 1 ] \
+    || [ "$pending_previous_seen" != 1 ] || [ "$pending_healthy_seen" != 1 ] \
+    || [ "$pending_failed_seen" != 1 ]; then
+    clear_stuck_update_pending malformed rollback-failed
+    return 1
+  fi
+
+  if [ -z "$pending_started_at" ]; then
+    pending_started_at=$(update_pending_mtime "$pending_file" 2>/dev/null || true)
+  fi
+  pending_max_age=$UPDATE_PENDING_MAX_AGE
+  update_pending_is_uint "$pending_max_age" || pending_max_age=7200
+  pending_now=$(date +%s 2>/dev/null || true)
+  if update_pending_is_uint "$pending_started_at" && update_pending_is_uint "$pending_now" \
+    && [ "$pending_now" -ge "$pending_started_at" ] \
+    && [ $((pending_now - pending_started_at)) -ge "$pending_max_age" ]; then
+    clear_stuck_update_pending stale stale
+    return 1
+  fi
+  return 0
+}
+
 snapshot_update_state() {
   [ "$UPDATE_MODE" = "1" ] || return 0
-  [ ! -e "$UPDATE_DIR/pending" ] \
-    || die "Предыдущее обновление ещё проходит проверку. Повтори через 10 минут."
+  if update_pending_is_running; then
+    die "Предыдущее обновление ещё проходит проверку. Повтори через 10 минут."
+  fi
 
   PREVIOUS_VERSION=$(cat "$(update_root_path etc/space-link/version)" 2>/dev/null || echo unknown)
   service_was_enabled space-link && PREVIOUS_SPACE_LINK_ENABLED=1 || PREVIOUS_SPACE_LINK_ENABLED=0
@@ -708,12 +799,14 @@ install_update_guard() {
 
 write_update_pending() {
   mkdir -p "$UPDATE_DIR"
+  pending_started_at=$(date +%s 2>/dev/null || true)
   pending_tmp="$UPDATE_DIR/pending.tmp.$$"
   cat > "$pending_tmp" <<EOF
 candidate_version=$VERSION
 previous_version=$PREVIOUS_VERSION
 healthy_checks=0
 failed_checks=0
+grace_checks=0
 expect_wifi=${EXPECT_WIFI:-0}
 previous_space_link_enabled=$PREVIOUS_SPACE_LINK_ENABLED
 previous_space_link_running=$PREVIOUS_SPACE_LINK_RUNNING
@@ -723,6 +816,7 @@ previous_lighttpd_enabled=$PREVIOUS_LIGHTTPD_ENABLED
 previous_lighttpd_running=$PREVIOUS_LIGHTTPD_RUNNING
 previous_tproxy_armed=$PREVIOUS_TPROXY_ARMED
 EOF
+  [ -n "$pending_started_at" ] && printf 'started_at=%s\n' "$pending_started_at" >> "$pending_tmp"
   chmod 0600 "$pending_tmp" 2>/dev/null || true
   mv "$pending_tmp" "$UPDATE_DIR/pending"
 }
@@ -924,7 +1018,13 @@ configure_panel_ip() {
 ip addr show br-lan 2>/dev/null | grep -q "inet __PANEL_IP__/" \
   || ip addr add "__PANEL_IP__/24" dev br-lan 2>/dev/null || true
 HOOK
-    sed -i "s/__PANEL_IP__/$PANEL_IP/g" "$panel_hotplug"
+    panel_hotplug_tmp="$panel_hotplug.tmp.$$"
+    if ! sed "s|__PANEL_IP__|$PANEL_IP|g" "$panel_hotplug" > "$panel_hotplug_tmp"; then
+      rm -f "$panel_hotplug_tmp"
+      die "Не удалось сохранить настройки адреса панели"
+    fi
+    mv "$panel_hotplug_tmp" "$panel_hotplug" \
+      || die "Не удалось сохранить настройки адреса панели"
     chmod 0755 "$panel_hotplug"
 
     ok "доп. IP $PANEL_IP/24 добавлен без перезапуска сети; основной $ROUTER_IP сохранён"
