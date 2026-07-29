@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.42"
+VERSION="0.3.43"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -963,6 +963,132 @@ install_templates() {
   fi
   chmod 0755 /usr/bin/space-link-dns 2>/dev/null || true
   ok "DNS controller"
+}
+
+# ---- LAN prefix ------------------------------------------------------------
+# Both our box and almost every ISP router ship on 192.168.1.1. Plugged into
+# each other they share a prefix, the default gateway resolves to our own
+# bridge, and nothing routes: no internet, no tunnel — while the panel still
+# answers, because a local address needs no routing. A fresh install therefore
+# moves onto a prefix of our own. Existing installs keep whatever they have.
+LAN_CANDIDATES="192.168.11.1 192.168.77.1 192.168.99.1 10.71.0.1"
+
+# Networks currently reachable through the upstream link. WAN_TEST_NETWORKS
+# lets the contract suite drive this without a real interface.
+wan_networks() {
+  if [ -n "${WAN_TEST_NETWORKS:-}" ]; then
+    printf '%s\n' $WAN_TEST_NETWORKS
+    return 0
+  fi
+  ip -4 route show 2>/dev/null | awk '$1 ~ /\// && $0 !~ /br-lan/ { print $1 }'
+  ip -4 route show default 2>/dev/null | awk '{ print $3 }'
+}
+
+# Compare only the first three octets: every candidate is a /24, and an ISP
+# router handing out a wider mask still overlaps us on that boundary.
+lan_prefix_conflicts() {
+  candidate_prefix=$(printf '%s\n' "${1:-}" | cut -d. -f1-3)
+  [ -n "$candidate_prefix" ] || return 1
+  for network in $(wan_networks); do
+    network_prefix=$(printf '%s\n' "$network" | cut -d/ -f1 | cut -d. -f1-3)
+    [ "$network_prefix" = "$candidate_prefix" ] && return 0
+  done
+  return 1
+}
+
+pick_lan_prefix() {
+  for candidate in $LAN_CANDIDATES; do
+    lan_prefix_conflicts "$candidate" && continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  return 1
+}
+
+# Runs on updates too: every router shipped so far sits on the vendor default,
+# and that is exactly the prefix an ISP box occupies. A prefix the user chose
+# themselves is left alone unless it actually collides with the upstream.
+relocate_lan_subnet() {
+  [ "${KEEP_LAN:-0}" = "1" ] && return 0
+  command -v uci >/dev/null 2>&1 || return 0
+
+  current=$(uci -q get network.lan.ipaddr 2>/dev/null | awk '{print $1}' | cut -d'/' -f1)
+  [ -n "$current" ] || return 0
+  current_prefix=$(printf '%s\n' "$current" | cut -d. -f1-3)
+
+  needs_move=0
+  # 192.168.1.x is what both we and virtually every ISP router ship with.
+  [ "$current_prefix" = "192.168.1" ] && needs_move=1
+  lan_prefix_conflicts "$current" && needs_move=1
+  [ "$needs_move" = "1" ] || return 0
+
+  target=$(pick_lan_prefix) || {
+    warn "все запасные подсети заняты сетью провайдера — оставляю $current"
+    return 0
+  }
+  target_prefix=$(printf '%s\n' "$target" | cut -d. -f1-3)
+  [ "$target_prefix" = "$current_prefix" ] && return 0
+
+  step "Своя подсеть роутера: $target (была $current)"
+  uci -q set network.lan.ipaddr="$target" || { warn "не удалось задать адрес — оставляю $current"; return 0; }
+  uci -q set network.lan.netmask="255.255.255.0" 2>/dev/null || true
+  relocate_static_leases "$current_prefix" "$target_prefix"
+  shorten_dhcp_lease
+  uci -q commit network || { warn "не удалось сохранить адрес — оставляю $current"; return 0; }
+  uci -q commit dhcp >/dev/null 2>&1 || true
+
+  # Reload, never a full restart: the installer is usually running through the
+  # very session that a restart would drop, and netifd takes longer to bring
+  # interfaces back.
+  /etc/init.d/network reload >/dev/null 2>&1 || true
+
+  # Keep the previous address alive as a plain alias so the running SSH/web
+  # session and every client still holding a lease keep working until they
+  # renew. It is not persisted, so it disappears on the next reboot.
+  ip addr add "$current/24" dev br-lan 2>/dev/null || true
+  LAN_LEGACY_IP="$current"
+
+  ROUTER_IP="$target"
+  PANEL_IP="${target_prefix}.2"
+  EFFECTIVE_BIND="$PANEL_IP"
+  ok "роутер теперь на $ROUTER_IP, панель на $PANEL_IP (старый адрес ещё отвечает до перезагрузки)"
+}
+
+# Static leases written for the old prefix would point at a network that no
+# longer exists; move them with the router instead of silently breaking them.
+relocate_static_leases() {
+  from="$1"
+  to="$2"
+  index=0
+  while :; do
+    lease_ip=$(uci -q get "dhcp.@host[$index].ip" 2>/dev/null) || break
+    [ -n "$lease_ip" ] || break
+    case "$lease_ip" in
+      "$from".*)
+        uci -q set "dhcp.@host[$index].ip=${to}.${lease_ip##*.}" >/dev/null 2>&1 || true
+        ;;
+    esac
+    index=$((index + 1))
+  done
+}
+
+# Clients keep the old gateway until their lease renews. Shorten it so the new
+# address propagates in minutes instead of hours; the original value is put
+# back once the install finishes.
+shorten_dhcp_lease() {
+  LAN_LEASETIME_ORIGINAL=$(uci -q get dhcp.lan.leasetime 2>/dev/null || echo "")
+  uci -q set dhcp.lan.leasetime="5m" >/dev/null 2>&1 || true
+}
+
+restore_dhcp_lease() {
+  [ -n "${LAN_LEGACY_IP:-}" ] || return 0
+  if [ -n "${LAN_LEASETIME_ORIGINAL:-}" ]; then
+    uci -q set dhcp.lan.leasetime="$LAN_LEASETIME_ORIGINAL" >/dev/null 2>&1 || true
+  else
+    uci -q delete dhcp.lan.leasetime >/dev/null 2>&1 || true
+  fi
+  uci -q commit dhcp >/dev/null 2>&1 || true
+  /etc/init.d/dnsmasq reload >/dev/null 2>&1 || true
 }
 
 # ---- panel IP alias --------------------------------------------------------
@@ -2159,6 +2285,7 @@ install_binary
 install_ui
 install_rules
 begin_update_transaction
+relocate_lan_subnet
 configure_panel_ip
 [ "$UPDATE_MODE" = "1" ] || install_update_guard
 install_templates
@@ -2172,6 +2299,7 @@ write_panel_hosts
 apply_dns_pinning
 activate_traffic_path
 install_cron
+restore_dhcp_lease
 start_update_guard
 final_summary
 INSTALL_SUCCESS=1
