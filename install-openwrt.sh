@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.41"
+VERSION="0.3.42"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -1632,6 +1632,64 @@ configure_protected_dns() {
     warn "sing-box DNS не ответил — сохранён прежний рабочий DNS"
   fi
 }
+# ---- LAN DNS pinning -------------------------------------------------------
+# `address=/my.space/...` only helps clients that actually ask us. A device
+# with 8.8.8.8 hardcoded resolves my.space on the internet, where it is a real
+# registered domain parked on someone else's IP — that is why the panel opens
+# in one browser and not in another. Redirect every LAN query for port 53 to
+# our own resolver, and reject DoT so clients fall back to plain 53 which we
+# now own. DoH cannot be intercepted; the Firefox canary below handles Firefox,
+# and sing-box resolves the panel names locally for the tunnelled path.
+write_dns_pinning_ruleset() {
+  target="${DNS_PIN_FILE:-/etc/space-link/dns-pinning.nft}"
+  mkdir -p "$(dirname "$target")" 2>/dev/null || true
+  cat > "$target" <<'NFT'
+table inet space_link_dns
+delete table inet space_link_dns
+
+table inet space_link_dns {
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+
+        # Queries already addressed to the router reach dnsmasq on their own.
+        fib daddr type local return
+        iifname "br-lan" meta l4proto { tcp, udp } th dport 53 redirect to :53
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+
+        # DNS-over-TLS would bypass the redirect above; rejecting it makes
+        # clients fall back to port 53 instead of silently using a stranger's
+        # resolver. Reject (not drop) so the fallback is immediate.
+        iifname "br-lan" meta l4proto tcp th dport 853 reject
+    }
+}
+NFT
+}
+
+apply_dns_pinning() {
+  step "Локальные имена роутера для всей сети"
+  command -v nft >/dev/null 2>&1 || { warn "nft отсутствует — пропускаю"; return 0; }
+  write_dns_pinning_ruleset
+  if nft -f /etc/space-link/dns-pinning.nft >/dev/null 2>&1; then
+    ok "запросы имён из сети обслуживает сам роутер"
+  else
+    warn "не удалось включить перехват DNS — имена будут работать только у устройств с DNS роутера"
+  fi
+}
+
+# The router's own processes must resolve the panel too, and /etc/hosts keeps
+# working even while dnsmasq is being restarted.
+write_panel_hosts() {
+  hosts_file="${PANEL_HOSTS_FILE:-/etc/hosts}"
+  [ -f "$hosts_file" ] || return 0
+  tmp="${hosts_file}.space-link.$$"
+  grep -v '# space-link-panel$' "$hosts_file" > "$tmp" 2>/dev/null || cp "$hosts_file" "$tmp"
+  printf '%s my.space my.sapce panel.home.arpa # space-link-panel\n' "$EFFECTIVE_BIND" >> "$tmp"
+  mv "$tmp" "$hosts_file"
+}
+
 
 # Remove every current or legacy rule owned by Space Link. Matching the values
 # already present is what removes unknown stale IPs; the fixed candidate list
@@ -1641,7 +1699,7 @@ _dns_uci_purge_all() {
   [ -n "$addrs" ] || return 0
   for a in $addrs; do
     case "$a" in
-      */my.space/*|*/my.sapce/*|*/spacelink.lan/*|*/my.spacelink/*)
+      */my.space/*|*/my.sapce/*|*/spacelink.lan/*|*/my.spacelink/*|*/panel.home.arpa/*)
         uci -q del_list dhcp.@dnsmasq[0].address="$a" >/dev/null 2>&1 || true
         ;;
     esac
@@ -1654,6 +1712,21 @@ _dns_uci_normalize() {
   uci -q add_list dhcp.@dnsmasq[0].address="/my.space/" >/dev/null 2>&1 || return 1
   uci -q add_list dhcp.@dnsmasq[0].address="/my.sapce/$EFFECTIVE_BIND" >/dev/null 2>&1 || return 1
   uci -q add_list dhcp.@dnsmasq[0].address="/my.sapce/" >/dev/null 2>&1 || return 1
+  # RFC 8375 reserves home.arpa for home networks: unlike my.space it can never
+  # be registered by anyone, so this name is immune to a public answer.
+  uci -q add_list dhcp.@dnsmasq[0].address="/panel.home.arpa/$EFFECTIVE_BIND" >/dev/null 2>&1 || return 1
+  uci -q add_list dhcp.@dnsmasq[0].address="/panel.home.arpa/" >/dev/null 2>&1 || return 1
+  # Firefox turns its own DoH off when this canary domain returns NXDOMAIN,
+  # which keeps the browser using the resolver we control.
+  _dns_uci_canary
+}
+
+_dns_uci_canary() {
+  servers=$(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null || true)
+  for s in $servers; do
+    [ "$s" = "/use-application-dns.net/" ] && return 0
+  done
+  uci -q add_list dhcp.@dnsmasq[0].server="/use-application-dns.net/" >/dev/null 2>&1 || return 1
 }
 
 # Non-UCI variants still read /etc/dnsmasq.conf. Rewrite only Space Link's
@@ -1662,7 +1735,8 @@ _dns_file_normalize() {
   conf="$1"
   tmp="${conf}.space-link.$$"
   if ! awk '
-    /^[[:space:]]*(address|local)=\/(my\.space|my\.sapce|my\.spacelink|spacelink\.lan)\// { next }
+    /^[[:space:]]*(address|local)=\/(my\.space|my\.sapce|my\.spacelink|spacelink\.lan|panel\.home\.arpa)\// { next }
+    /^[[:space:]]*server=\/use-application-dns\.net\// { next }
     { print }
   ' "$conf" > "$tmp"; then
     rm -f "$tmp"
@@ -1672,6 +1746,9 @@ _dns_file_normalize() {
   printf 'local=/my.space/\n' >> "$tmp"
   printf 'address=/my.sapce/%s\n' "$EFFECTIVE_BIND" >> "$tmp"
   printf 'local=/my.sapce/\n' >> "$tmp"
+  printf 'address=/panel.home.arpa/%s\n' "$EFFECTIVE_BIND" >> "$tmp"
+  printf 'local=/panel.home.arpa/\n' >> "$tmp"
+  printf 'server=/use-application-dns.net/\n' >> "$tmp"
   mv "$tmp" "$conf"
 }
 
@@ -1694,7 +1771,8 @@ _dns_sed_scrub() {
 _dns_verify() {
   pgrep dnsmasq >/dev/null 2>&1 || return 1
   addrs=$(uci -q get dhcp.@dnsmasq[0].address 2>/dev/null || true)
-  for expected in "/my.space/$EFFECTIVE_BIND" "/my.space/" "/my.sapce/$EFFECTIVE_BIND" "/my.sapce/"; do
+  for expected in "/my.space/$EFFECTIVE_BIND" "/my.space/" "/my.sapce/$EFFECTIVE_BIND" "/my.sapce/" \
+    "/panel.home.arpa/$EFFECTIVE_BIND" "/panel.home.arpa/"; do
     found=0
     for a in $addrs; do
       [ "$a" = "$expected" ] && found=$((found + 1))
@@ -1704,6 +1782,7 @@ _dns_verify() {
   if command -v nslookup >/dev/null 2>&1; then
     nslookup my.space 127.0.0.1 2>/dev/null | grep -q "$EFFECTIVE_BIND" || return 1
     nslookup my.sapce 127.0.0.1 2>/dev/null | grep -q "$EFFECTIVE_BIND" || return 1
+    nslookup panel.home.arpa 127.0.0.1 2>/dev/null | grep -q "$EFFECTIVE_BIND" || return 1
   fi
   return 0
 }
@@ -1866,6 +1945,28 @@ if [ -s /etc/space-link/active-server ] && pgrep sing-box >/dev/null 2>&1 \
     /etc/init.d/space-link-tproxy start >/dev/null 2>&1 || /etc/init.d/space-link-tproxy reload >/dev/null 2>&1 || true
   fi
 fi
+
+# DNS pinning self-heal, fail-open. The redirect funnels every LAN query into
+# our resolver, so a dead dnsmasq would take the whole network's DNS with it.
+# Drop the redirect while the resolver is silent, restore it once it answers.
+if command -v nft >/dev/null 2>&1; then
+  resolver_ok=0
+  if command -v nslookup >/dev/null 2>&1; then
+    nslookup my.space 127.0.0.1 >/dev/null 2>&1 && resolver_ok=1
+  elif pgrep dnsmasq >/dev/null 2>&1; then
+    resolver_ok=1
+  fi
+  if [ "$resolver_ok" = "1" ]; then
+    if [ -f /etc/space-link/dns-pinning.nft ] \
+       && ! nft list table inet space_link_dns >/dev/null 2>&1; then
+      log "перехват DNS пропал — возвращаю локальные имена для сети"
+      nft -f /etc/space-link/dns-pinning.nft >/dev/null 2>&1 || true
+    fi
+  elif nft list table inet space_link_dns >/dev/null 2>&1; then
+    log "локальный DNS молчит — снимаю перехват, чтобы сеть не осталась без имён"
+    nft delete table inet space_link_dns >/dev/null 2>&1 || true
+  fi
+fi
 WATCHDOG
   chmod 0755 /usr/bin/space-link-panel-watchdog
   ok "panel watchdog"
@@ -2022,7 +2123,10 @@ final_summary() {
 
   printf '\n'
   if [ "$dns_ok" = "1" ] && [ "$api_ok" = "1" ] && [ "$http_ok" = "1" ]; then
-    printf '   Установка успешна. Открывай: http://my.space%s\n' "$port_suffix"
+    # The IP works no matter which DNS the device uses; names can be hijacked
+    # by a public resolver, so show the address that always answers first.
+    printf '   Установка успешна. Открывай: http://%s%s\n' "$EFFECTIVE_BIND" "$port_suffix"
+    printf '   Также работает: http://my.space%s и http://panel.home.arpa%s\n' "$port_suffix" "$port_suffix"
   else
     printf '   Установка завершена с предупреждениями. Запусти %s ещё раз — установщик попробует починить.\n' "$0"
   fi
@@ -2064,6 +2168,8 @@ install_panel_watchdog
 enable_services
 configure_dns
 configure_protected_dns
+write_panel_hosts
+apply_dns_pinning
 activate_traffic_path
 install_cron
 start_update_guard

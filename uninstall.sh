@@ -75,6 +75,12 @@ if command -v uci >/dev/null 2>&1; then
 fi
 if command -v nft >/dev/null 2>&1; then
   nft delete table inet space_link >/dev/null 2>&1 || true
+  nft delete table inet space_link_dns >/dev/null 2>&1 || true
+fi
+rm -f /etc/space-link/dns-pinning.nft 2>/dev/null || true
+# Panel names pinned in /etc/hosts must go with the rest.
+if [ -f /etc/hosts ] && grep -q '# space-link-panel$' /etc/hosts 2>/dev/null; then
+  sed -i '/# space-link-panel$/d' /etc/hosts 2>/dev/null || true
 fi
 if command -v fw4 >/dev/null 2>&1; then
   fw4 reload >/dev/null 2>&1 || true
@@ -89,7 +95,7 @@ if command -v uci >/dev/null 2>&1; then
   if [ -n "$addrs" ]; then
     for a in $addrs; do
       case "$a" in
-        */my.space/*|*/my.sapce/*|*/my.spacelink/*|*/spacelink.lan/*)
+        */my.space/*|*/my.sapce/*|*/my.spacelink/*|*/spacelink.lan/*|*/panel.home.arpa/*)
           uci -q del_list dhcp.@dnsmasq[0].address="$a" >/dev/null 2>&1 || true
           ;;
       esac
