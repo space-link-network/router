@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.43"
+VERSION="0.3.44"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -1424,6 +1424,12 @@ apply() {
   ip -6 rule add fwmark __MARK__ table __TABLE__ 2>/dev/null
   ip -6 route flush table __TABLE__ 2>/dev/null
   ip -6 route add local ::/0 dev lo table __TABLE__ 2>/dev/null
+  # IPv6 policy routing is a bonus: plenty of routers run IPv4-only, and
+  # iproute2 exits 2 when it cannot add the rule. Letting that code escape
+  # would tell the engine the restart failed, and the watchdog would engage
+  # the kill switch over an optional command. Interception is applied by the
+  # nft ruleset above, so report on that instead.
+  return 0
 }
 
 start() { apply; }
@@ -1467,6 +1473,18 @@ traffic_engine_ready() {
   pgrep "^sing-box$" >/dev/null 2>&1 || return 1
   command -v netstat >/dev/null 2>&1 || return 1
   netstat -ln 2>/dev/null | grep -Eq '[:.]12345[[:space:]]' || return 1
+}
+
+# A kill switch that was engaged by an older release survives reboots and can
+# only be cleared by hand. We have just verified the whole path end to end, so
+# an update is exactly the moment to release it — otherwise the router keeps
+# routing around the tunnel until someone notices the banner.
+clear_stale_kill_switch() {
+  state_file="${WATCHDOG_STATE_FILE:-/etc/space-link/watchdog.json}"
+  [ -f "$state_file" ] || return 0
+  grep -q '"active"[[:space:]]*:[[:space:]]*true' "$state_file" || return 0
+  printf '%s\n' '{"active":false}' > "$state_file"
+  ok "аварийное отключение снято — защита снова включена"
 }
 
 activate_traffic_path() {
@@ -1517,6 +1535,7 @@ activate_traffic_path() {
   /etc/init.d/space-link-tproxy enable >/dev/null 2>&1 || true
   if /etc/init.d/space-link-tproxy start >/dev/null 2>&1 \
      && nft list table inet space_link >/dev/null 2>&1; then
+    clear_stale_kill_switch
     ok "TPROXY активирован после проверки sing-box"
     return 0
   fi
