@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.45"
+VERSION="0.3.46"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -1939,11 +1939,18 @@ install_panel_watchdog() {
 #!/bin/sh
 
 # procd runs this mode continuously. Each check is a separate process so a
-# single stuck/failed command cannot permanently kill the recovery loop.
+# single stuck/failed command cannot permanently kill the recovery loop. Most
+# ticks take the cheap panel path; every tenth also audits DNS and interception.
 if [ "${1:-}" = "--loop" ]; then
+  check_count=0
   while :; do
-    "$0" --once
-    sleep 30
+    check_count=$((check_count + 1))
+    if [ $((check_count % 10)) -eq 0 ]; then
+      "$0" --full
+    else
+      "$0" --once
+    fi
+    sleep 60
   done
 fi
 # Self-heal for the local router panel. VPN data-plane may be fine while the
@@ -1983,12 +1990,38 @@ restart_service() {
 
 
 conf="/etc/lighttpd/conf.d/space-link.conf"
-bind="$(awk -F'"' '/server.bind/ { print $2; exit }' "$conf" 2>/dev/null)"
-port="$(awk '/server.port/ { print $3; exit }' "$conf" 2>/dev/null)"
-[ -n "$bind" ] || bind="$(uci -q get network.lan.ipaddr 2>/dev/null || echo 192.168.1.1)"
-[ -n "$port" ] || port="80"
+target_cache="/tmp/space-link-panel-watchdog.target"
+bind=""
+port=""
+# Config parsing needs two awk processes, so reuse the RAM-backed result on the
+# nine cheap ticks between full audits. A full audit refreshes it from lighttpd.
+if [ "${1:-}" != "--full" ] && [ -r "$target_cache" ]; then
+  {
+    IFS= read -r bind || bind=""
+    IFS= read -r port || port=""
+  } < "$target_cache"
+fi
+if [ -z "$bind" ] || [ -z "$port" ]; then
+  bind="$(awk -F'"' '/server.bind/ { print $2; exit }' "$conf" 2>/dev/null)"
+  port="$(awk '/server.port/ { print $3; exit }' "$conf" 2>/dev/null)"
+  [ -n "$bind" ] || bind="$(uci -q get network.lan.ipaddr 2>/dev/null || echo 192.168.1.1)"
+  [ -n "$port" ] || port="80"
+  printf '%s\n%s\n' "$bind" "$port" > "$target_cache"
+fi
 panel_url="http://$bind:$port/"
 [ "$port" = "80" ] && panel_url="http://$bind/"
+
+# The healthy path is deliberately only one HTTP probe plus one process check.
+# Recovery and the periodic full audit continue into the checks below.
+panel_healthy=0
+lighttpd_healthy=0
+lighttpd_restarted=0
+panel_ok "$panel_url" "my.space" && panel_healthy=1
+pgrep -x lighttpd >/dev/null 2>&1 && lighttpd_healthy=1
+if [ "${1:-}" != "--full" ] \
+   && [ "$panel_healthy" = "1" ] && [ "$lighttpd_healthy" = "1" ]; then
+  exit 0
+fi
 
 # Secondary-IP self-heal: панель слушает на $bind (напр. 192.168.1.2). После
 # ребута netifd иногда не поднимает второй адрес вовремя (или lighttpd стартует
@@ -2001,23 +2034,32 @@ case "$bind" in
       log "панельный IP $bind не поднят на br-lan — добавляю и перезапускаю lighttpd"
       ip addr add "$bind/24" dev br-lan 2>/dev/null || true
       restart_service lighttpd "panel IP $bind was missing after boot"
+      lighttpd_restarted=1
       sleep 2
     fi
     ;;
 esac
 
-if ! pgrep -x lighttpd >/dev/null 2>&1; then
-  restart_service lighttpd "process not running"
-  sleep 2
-elif ! panel_ok "$panel_url" "my.space"; then
-  restart_service lighttpd "panel http check failed ($panel_url)"
-  sleep 2
+if [ "$lighttpd_restarted" != "1" ]; then
+  if [ "$lighttpd_healthy" != "1" ]; then
+    restart_service lighttpd "process not running"
+    lighttpd_restarted=1
+    sleep 2
+  elif [ "$panel_healthy" != "1" ]; then
+    restart_service lighttpd "panel http check failed ($panel_url)"
+    lighttpd_restarted=1
+    sleep 2
+  fi
 fi
 
-if ! pgrep -x lighttpd >/dev/null 2>&1; then
-  log "lighttpd still not running after restart"
-elif ! panel_ok "$panel_url" "my.space"; then
-  log "panel still not reachable after lighttpd restart ($panel_url)"
+# Re-probe only after a recovery action. A healthy full audit reuses the probe
+# above instead of curling the same panel twice.
+if [ "$lighttpd_restarted" = "1" ]; then
+  if ! pgrep -x lighttpd >/dev/null 2>&1; then
+    log "lighttpd still not running after restart"
+  elif ! panel_ok "$panel_url" "my.space"; then
+    log "panel still not reachable after lighttpd restart ($panel_url)"
+  fi
 fi
 
 # Local panel aliases self-heal. my.space is canonical; my.sapce is retained
