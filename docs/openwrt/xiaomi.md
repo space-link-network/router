@@ -11,14 +11,14 @@
 | Модель | Версия | Память (RAM / flash) | Space Link | Сложность |
 |---|---|---|---|---|
 | [Xiaomi Router AX3000T](https://openwrt.org/toh/xiaomi/ax3000t) | RD03 (Китай), RD23 (международная) | 256 МБ / 128 МБ NAND | подходит | высокая |
-| Xiaomi Router AX3000T | RD03v2, SKU DVB4510CN | не указана в ToH | **не подходит: OpenWrt не поддерживает эту ревизию** | не прошивать |
 | [Xiaomi Router AX3200](https://openwrt.org/toh/xiaomi/ax3200) | RB01, с доступом по Telnet | 256 МБ / 128 МБ NAND | подходит | высокая |
-| Xiaomi Router AX3200 | RB01, выпущен после 12.2023, Telnet закрыт | 256 МБ / 128 МБ NAND | железо подходит, но **не рекомендуем: велик риск блокировки** | нужен UART |
 | [Redmi AX6S](https://openwrt.org/toh/xiaomi/ax3200) | RB03 | 256 МБ / 128 МБ NAND | подходит | высокая |
 | [Redmi AX6000](https://openwrt.org/toh/xiaomi/redmi_ax6000) | китайская версия | 512 МБ / 128 МБ NAND | подходит, лучший запас памяти | высокая |
 | [Xiaomi Mi Router 3G](https://openwrt.org/toh/xiaomi/mir3g) | v1, есть USB-порт | 256 МБ / 128 МБ NAND | подходит, но роутер старый и медленный | средняя |
-| [Xiaomi Mi Router 3G](https://openwrt.org/toh/xiaomi/mir3g) | v2, USB-порта нет | 128 МБ / 16 МБ | **не подойдёт: мало flash-памяти** | не прошивать для Space Link |
-| [Xiaomi Mi Router 4A Gigabit Edition](https://openwrt.org/toh/xiaomi/xiaomi_mi_router_4a_gigabit_edition) | R4AG / RB02, v1 или v2 | 128 МБ / 16 МБ | **не подойдёт: мало flash-памяти** | не прошивать для Space Link |
+
+**Не подойдут:** Xiaomi Router AX3000T RD03v2 — OpenWrt её не поддерживает; Xiaomi Router AX3200 после 12.2023 с закрытым Telnet — прошивка может вывести роутер из строя; Mi Router 3G v2 и Mi Router 4A Gigabit v1/v2 — 16 МБ flash, установка не поместится.
+
+> **Вашей модели нет в списке?** Это не значит, что она не подойдёт. Откройте [firmware-selector.openwrt.org](https://firmware-selector.openwrt.org), введите название роутера — если он есть в списке, прошивка для него существует. Затем на [странице модели](https://openwrt.org/toh/start) проверьте два числа: **RAM не меньше 128 МБ** и **flash не меньше 32 МБ**.
 
 Память, архитектура и поддержка каждой строки сверены с текущей
 [Table of Hardware](https://openwrt.org/toh/start), страницами моделей и

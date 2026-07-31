@@ -21,18 +21,14 @@ Space Link ставится на роутер с прошивкой **OpenWrt 23
 
 | Производитель | Инструкция | Сложность прошивки |
 |---|---|---|
-| GL.iNet, Cudy | [gl-inet.md](gl-inet.md) | OpenWrt уже стоит с завода |
-| TP-Link | [tp-link.md](tp-link.md) | простая — через веб-интерфейс |
+| GL.iNet, Cudy | [gl-inet.md](gl-inet.md) | по модели: от уже установленной OpenWrt до двух обновлений |
+| TP-Link, Mercusys | [tp-link.md](tp-link.md) | по модели: от обычного обновления до мастерской |
 | Asus, Netgear, Zyxel | [asus-netgear.md](asus-netgear.md) | простая, есть штатное восстановление |
 | Netis (NX31, NX32U) | [netis-filogic.md](netis-filogic.md) | средняя — через TFTP |
 | Xiaomi, Redmi | [xiaomi.md](xiaomi.md) | сложная — нужно снимать блокировку |
 | Keenetic | [../keenetic.md](../keenetic.md) | в разработке |
 
-Вашей модели нет в списке? Это не значит, что она не подойдёт — производителей
-сотни. Проверьте её в
-[базе поддерживаемых устройств OpenWrt](https://openwrt.org/toh/start) и
-действуйте по инструкции для похожего роутера того же производителя: порядок
-шагов внутри одного вендора обычно совпадает.
+> **Вашей модели нет в списке?** Это не значит, что она не подойдёт. Откройте [firmware-selector.openwrt.org](https://firmware-selector.openwrt.org), введите название роутера — если он есть в списке, прошивка для него существует. Затем на [странице модели](https://openwrt.org/toh/start) проверьте два числа: **RAM не меньше 128 МБ** и **flash не меньше 32 МБ**.
 
 ---
 
