@@ -18,5 +18,5 @@ wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 
 ## Что уже сейчас
 
-- На OpenWrt всё работает — см. [OpenWrt: полная установка](openwrt.md).
+- На OpenWrt всё работает — см. [инструкции по роутерам](openwrt/README.md).
 - Следить за обновлениями и задать вопрос: [@spacelink_support](https://t.me/spacelink_support).

@@ -6,7 +6,9 @@
 
 Подробные инструкции:
 
-- [OpenWrt — полная установка](docs/openwrt.md)
+- [Выбор роутера](docs/openwrt/vybor-routera.md) — какой купить и подойдёт ли ваш
+- [Инструкции по роутерам](docs/openwrt/README.md) — прошивка OpenWrt под каждую модель
+- [Установка Space Link](docs/openwrt/install.md) — если OpenWrt уже стоит
 - [Keenetic — в разработке](docs/keenetic.md)
 - [Решение проблем](docs/troubleshooting.md)
 
@@ -72,7 +74,7 @@ wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/uninstall.sh | sh 
 
 | Прошивка | Статус | Инструкция |
 | --- | --- | --- |
-| OpenWrt 23.05+ | поддерживается | [docs/openwrt.md](docs/openwrt.md) |
+| OpenWrt 23.05+ | поддерживается | [инструкции по моделям](docs/openwrt/README.md) |
 | Keenetic | в разработке | [docs/keenetic.md](docs/keenetic.md) |
 
 ---
