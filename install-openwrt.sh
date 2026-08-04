@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.53"
+VERSION="0.3.54"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -1938,19 +1938,39 @@ install_panel_watchdog() {
   cat > /usr/bin/space-link-panel-watchdog <<'WATCHDOG'
 #!/bin/sh
 
-# procd runs this mode continuously. Each check is a separate process so a
-# single stuck/failed command cannot permanently kill the recovery loop. Most
-# ticks take the cheap panel path; every tenth also audits DNS and interception.
+# procd runs this mode continuously. HTTP probes have bounded deadlines and
+# each check is a child process, so a failed check cannot exit the recovery
+# loop. Thirty 20-second ticks preserve the full audit's ten-minute cadence.
+# Persistent failures back off restart attempts while healthy ticks stay fast.
 if [ "${1:-}" = "--loop" ]; then
+  check_interval=20
+  full_audit_ticks=30
+  max_failure_backoff=300
   check_count=0
+  consecutive_failures=0
   while :; do
     check_count=$((check_count + 1))
-    if [ $((check_count % 10)) -eq 0 ]; then
-      "$0" --full
-    else
-      "$0" --once
+    check_mode="--once"
+    if [ "$check_count" -ge "$full_audit_ticks" ]; then
+      check_mode="--full"
+      check_count=0
     fi
-    sleep 60
+
+    if "$0" "$check_mode"; then
+      consecutive_failures=0
+      next_delay="$check_interval"
+    else
+      consecutive_failures=$((consecutive_failures + 1))
+      backoff_steps="$consecutive_failures"
+      next_delay="$check_interval"
+      while [ "$backoff_steps" -gt 0 ] && [ "$next_delay" -lt "$max_failure_backoff" ]; do
+        next_delay=$((next_delay * 2))
+        [ "$next_delay" -le "$max_failure_backoff" ] || next_delay="$max_failure_backoff"
+        backoff_steps=$((backoff_steps - 1))
+      done
+    fi
+
+    sleep "$next_delay" || true
   done
 fi
 # Self-heal for the local router panel. VPN data-plane may be fine while the
@@ -1963,22 +1983,14 @@ log() {
 http_ok() {
   url="$1"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsS -m 3 "$url" >/dev/null 2>&1
+    curl -fsS -m 2 "$url" >/dev/null 2>&1
     return $?
   fi
-  wget -q --timeout=3 -O- "$url" >/dev/null 2>&1
+  wget -q --timeout=2 -O- "$url" >/dev/null 2>&1
 }
 
 panel_ok() {
-  url="$1"
-  host="$2"
-  http_ok "$url" && return 0
-  http_ok "http://my.space/" && return 0
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsS -m 3 -H "Host: $host" "$url" >/dev/null 2>&1
-    return $?
-  fi
-  return 1
+  http_ok "$1"
 }
 
 restart_service() {
@@ -1988,13 +2000,32 @@ restart_service() {
   /etc/init.d/"$svc" restart >/dev/null 2>&1 || /etc/init.d/"$svc" start >/dev/null 2>&1 || true
 }
 
+# Kill only the unhealthy API instance. Restarting /etc/init.d/space-link here
+# would also kill this watchdog and can resurrect a service an administrator
+# deliberately stopped. SIGKILL avoids waiting for the API's 10-second graceful
+# shutdown timeout when its HTTP server is already wedged; procd owns respawn.
+restart_api() {
+  reason="$1"
+  log "space-link-api unhealthy: $reason; requesting API instance restart"
+  if command -v ubus >/dev/null 2>&1 \
+     && ubus call service signal '{"name":"space-link","instance":"api","signal":9}' >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v killall >/dev/null 2>&1 \
+     && killall -KILL space-link-api >/dev/null 2>&1; then
+    return 0
+  fi
+  log "could not signal the space-link API process"
+  return 1
+}
+
 
 conf="/etc/lighttpd/conf.d/space-link.conf"
 target_cache="/tmp/space-link-panel-watchdog.target"
 bind=""
 port=""
 # Config parsing needs two awk processes, so reuse the RAM-backed result on the
-# nine cheap ticks between full audits. A full audit refreshes it from lighttpd.
+# 29 cheap ticks between full audits. A full audit refreshes it from lighttpd.
 if [ "${1:-}" != "--full" ] && [ -r "$target_cache" ]; then
   {
     IFS= read -r bind || bind=""
@@ -2011,16 +2042,32 @@ fi
 panel_url="http://$bind:$port/"
 [ "$port" = "80" ] && panel_url="http://$bind/"
 
-# The healthy path is deliberately only one HTTP probe plus one process check.
-# Recovery and the periodic full audit continue into the checks below.
+# A static index alone can look healthy while its proxied API is wedged. Probe
+# both loopback API and lighttpd on every cheap tick, then confirm the frontend
+# process still exists. Each HTTP request has its own two-second deadline.
+api_url="http://127.0.0.1:8080/api/local/status"
+api_healthy=0
 panel_healthy=0
 lighttpd_healthy=0
 lighttpd_restarted=0
-panel_ok "$panel_url" "my.space" && panel_healthy=1
+http_ok "$api_url" && api_healthy=1
+panel_ok "$panel_url" && panel_healthy=1
 pgrep -x lighttpd >/dev/null 2>&1 && lighttpd_healthy=1
 if [ "${1:-}" != "--full" ] \
-   && [ "$panel_healthy" = "1" ] && [ "$lighttpd_healthy" = "1" ]; then
+   && [ "$api_healthy" = "1" ] \
+   && [ "$panel_healthy" = "1" ] \
+   && [ "$lighttpd_healthy" = "1" ]; then
   exit 0
+fi
+
+if [ "$api_healthy" != "1" ]; then
+  restart_api "loopback HTTP check failed ($api_url)" || true
+  sleep 2
+  if http_ok "$api_url"; then
+    api_healthy=1
+  else
+    log "space-link API still not reachable after restart request"
+  fi
 fi
 
 # Secondary-IP self-heal: панель слушает на $bind (напр. 192.168.1.2). После
@@ -2056,17 +2103,27 @@ fi
 # above instead of curling the same panel twice.
 if [ "$lighttpd_restarted" = "1" ]; then
   if ! pgrep -x lighttpd >/dev/null 2>&1; then
+    lighttpd_healthy=0
     log "lighttpd still not running after restart"
-  elif ! panel_ok "$panel_url" "my.space"; then
+  else
+    lighttpd_healthy=1
+  fi
+  if panel_ok "$panel_url"; then
+    panel_healthy=1
+  else
+    panel_healthy=0
     log "panel still not reachable after lighttpd restart ($panel_url)"
   fi
 fi
 
-# Local panel aliases self-heal. my.space is canonical; my.sapce is retained
-# as a typo-safe alias so it never escapes to the public parked domain. Check
-# the persisted UCI values as well as A lookups: a lookup can contain the right
-# IP while a conflicting stale address or a missing HTTPS/SVCB blocker remains.
-if command -v uci >/dev/null 2>&1 && command -v nslookup >/dev/null 2>&1; then
+# Only the alias audit below is reserved for the scheduled full tick: it shells
+# out to nslookup several times and may rewrite UCI, which is too much to run
+# every twenty seconds. The protected-DNS and TPROXY self-heals further down
+# stay on every tick — they are two cheap status checks, and before this split
+# they ran once a minute. Making them ten times rarer would have traded a
+# faster panel for a slower recovery of the thing people actually notice: no
+# names resolving, or traffic quietly leaving the tunnel.
+if [ "${1:-}" = "--full" ] && command -v uci >/dev/null 2>&1 && command -v nslookup >/dev/null 2>&1; then
   aliases_ok=1
   canonical_ip=0
   canonical_local=0
@@ -2123,8 +2180,8 @@ fi
 
 # TPROXY self-heal: сервер выбран, трафикация не выключена и sing-box жив, но
 # nft-таблица заворота пропала (например не переподнялась после ребута) → трафик
-# уходит НАПРЯМУЮ мимо VPN. Переподнимаем заворот — «включено, а идёт напрямую»
-# чинится само (крон гоняет скрипт раз в минуту).
+# Without the table, active VPN traffic leaks directly. The ten-minute full
+# audit rebuilds interception without adding work to every light panel tick.
 if [ -s /etc/space-link/active-server ] && pgrep sing-box >/dev/null 2>&1 \
    && ! grep -q '"active":[[:space:]]*true' /etc/space-link/watchdog.json 2>/dev/null; then
   if command -v nft >/dev/null 2>&1 && ! nft list table inet space_link >/dev/null 2>&1; then
@@ -2154,6 +2211,12 @@ if command -v nft >/dev/null 2>&1; then
     nft delete table inet space_link_dns >/dev/null 2>&1 || true
   fi
 fi
+
+[ "$api_healthy" = "1" ] \
+  && [ "$panel_healthy" = "1" ] \
+  && [ "$lighttpd_healthy" = "1" ] \
+  && exit 0
+exit 1
 WATCHDOG
   chmod 0755 /usr/bin/space-link-panel-watchdog
   ok "panel watchdog"
