@@ -16,6 +16,13 @@ cleanup_cron_file() {
 if [ -x /usr/bin/space-link-dns ]; then
   /usr/bin/space-link-dns purge >/dev/null 2>&1 || true
 fi
+# Restore only values the IPv6 uplink controller temporarily suppressed. If the
+# operator already owned a disabled setup, no restore state exists and this is
+# a no-op.
+if [ -x /usr/bin/space-link-panel-watchdog ]; then
+  /usr/bin/space-link-panel-watchdog --ipv6-restore >/dev/null 2>&1 \
+    || printf 'WRN Не удалось восстановить прежние настройки IPv6 LAN\n' >&2
+fi
 
 printf '==> Останавливаю сервисы\n'
 /etc/init.d/space-link-update-guard stop 2>/dev/null || true

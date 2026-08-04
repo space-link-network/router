@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.55"
+VERSION="0.3.57"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -149,7 +149,9 @@ wait_service_up() {
     if /etc/init.d/"$svc" status 2>/dev/null | grep -q running; then
       return 0
     fi
-    if pgrep "^${svc}$" >/dev/null 2>&1; then
+    # BusyBox pgrep -x compares the full command line on deployed routers.
+    # pidof matches the executable name exactly, without argv substring hits.
+    if pidof "$svc" >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
@@ -292,7 +294,7 @@ rollback_uci() {
 # install прерывается, потому что без dnsmasq DHCP/DNS клиентам не работает.
 ensure_dnsmasq_alive() {
   step "Проверка dnsmasq"
-  if pgrep dnsmasq >/dev/null 2>&1; then
+  if pidof dnsmasq >/dev/null 2>&1; then
     ok "dnsmasq уже работает"
     return 0
   fi
@@ -300,7 +302,7 @@ ensure_dnsmasq_alive() {
   warn "dnsmasq не запущен — пробую поднять"
   /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
   sleep 2
-  if pgrep dnsmasq >/dev/null 2>&1; then
+  if pidof dnsmasq >/dev/null 2>&1; then
     ok "dnsmasq поднят"
     return 0
   fi
@@ -317,7 +319,7 @@ ensure_dnsmasq_alive() {
   fi
   /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
   sleep 2
-  if pgrep dnsmasq >/dev/null 2>&1; then
+  if pidof dnsmasq >/dev/null 2>&1; then
     ok "dnsmasq поднят (после чистки битых записей)"
     return 0
   fi
@@ -331,7 +333,7 @@ ensure_dnsmasq_alive() {
     sleep 2
   fi
 
-  if pgrep dnsmasq >/dev/null 2>&1; then
+  if pidof dnsmasq >/dev/null 2>&1; then
     ok "dnsmasq восстановлен из заводского конфига"
     return 0
   fi
@@ -616,6 +618,7 @@ usr/bin/space-link-update-guard
 etc/hotplug.d/iface/99-space-link-panel-ip
 etc/crontabs/root
 etc/space-link/version
+etc/space-link/lan-ipv6.restore
 etc/space-link/tproxy.nft
 etc/space-link/tproxy.armed
 EOF
@@ -854,6 +857,8 @@ start_update_guard() {
 restore_pre_activation_services() {
   dnsmasq_init=$(update_root_path etc/init.d/dnsmasq)
   [ -x "$dnsmasq_init" ] && "$dnsmasq_init" restart >/dev/null 2>&1 || true
+  odhcpd_init=$(update_root_path etc/init.d/odhcpd)
+  [ -x "$odhcpd_init" ] && "$odhcpd_init" restart >/dev/null 2>&1 || true
   if [ "$PREVIOUS_TPROXY_ARMED" = "1" ]; then
     tproxy_init=$(update_root_path etc/init.d/space-link-tproxy)
     [ -x "$tproxy_init" ] && "$tproxy_init" start >/dev/null 2>&1 || true
@@ -1008,13 +1013,41 @@ pick_lan_prefix() {
 # Runs on updates too: every router shipped so far sits on the vendor default,
 # and that is exactly the prefix an ISP box occupies. A prefix the user chose
 # themselves is left alone unless it actually collides with the upstream.
+# The panel alias is always the .2 address in the active /24. Re-derive it on
+# every run: an earlier installer may already have moved network.lan while
+# leaving the panel consumers pinned to the vendor-default address.
+sync_panel_ip_to_lan() {
+  panel_lan_ip="${1:-}"
+  case "$panel_lan_ip" in
+    *.*.*.*) ;;
+    *) return 1 ;;
+  esac
+  panel_lan_prefix=$(printf '%s\n' "$panel_lan_ip" | cut -d. -f1-3)
+  panel_target_ip="${panel_lan_prefix}.2"
+
+  if [ "$PANEL_IP" != "$panel_target_ip" ]; then
+    case " ${PANEL_STALE_IPS:-} " in
+      *" $PANEL_IP "*) ;;
+      *) PANEL_STALE_IPS="${PANEL_STALE_IPS:+$PANEL_STALE_IPS }$PANEL_IP" ;;
+    esac
+  fi
+  PANEL_IP="$panel_target_ip"
+  EFFECTIVE_BIND="$PANEL_IP"
+}
+
 relocate_lan_subnet() {
-  [ "${KEEP_LAN:-0}" = "1" ] && return 0
   command -v uci >/dev/null 2>&1 || return 0
 
   current=$(uci -q get network.lan.ipaddr 2>/dev/null | awk '{print $1}' | cut -d'/' -f1)
   [ -n "$current" ] || return 0
   current_prefix=$(printf '%s\n' "$current" | cut -d. -f1-3)
+
+  # Synchronize even when the LAN itself no longer needs moving. This is the
+  # repair path for installations where network.lan was committed but the
+  # panel files and runtime alias were left on the previous prefix.
+  sync_panel_ip_to_lan "$current" || return 0
+  ROUTER_IP="$current"
+  [ "${KEEP_LAN:-0}" = "1" ] && return 0
 
   needs_move=0
   # 192.168.1.x is what both we and virtually every ISP router ship with.
@@ -1049,10 +1082,10 @@ relocate_lan_subnet() {
   LAN_LEGACY_IP="$current"
 
   ROUTER_IP="$target"
-  PANEL_IP="${target_prefix}.2"
-  EFFECTIVE_BIND="$PANEL_IP"
+  sync_panel_ip_to_lan "$target" || return 0
   ok "роутер теперь на $ROUTER_IP, панель на $PANEL_IP (старый адрес ещё отвечает до перезагрузки)"
 }
+
 
 # Static leases written for the old prefix would point at a network that no
 # longer exists; move them with the router instead of silently breaking them.
@@ -1095,6 +1128,33 @@ restore_dhcp_lease() {
 # Пытается поднять alias-IP. Если не поднялся за 2 сек — fallback (Вариант A):
 # выключаем uhttpd, занимаем :80 на основном IP роутера. EFFECTIVE_BIND и
 # EFFECTIVE_PORT в конце отражают реальное место панели.
+# Disable the old hook before touching addresses: otherwise an interface event
+# can recreate the stale alias between deletion and the final atomic rewrite.
+# Only addresses recorded by this installer are candidates for removal.
+remove_stale_panel_aliases() {
+  stale_panel_hotplug="$1"
+  persisted_panel_ips=""
+  if [ -f "$stale_panel_hotplug" ]; then
+    persisted_panel_ips=$(sed -n 's|.*ip addr add "\([0-9][0-9.]*\)/24".*|\1|p' "$stale_panel_hotplug" 2>/dev/null || true)
+    rm -f "$stale_panel_hotplug" \
+      || die "Не удалось отключить устаревший hotplug адреса панели"
+  fi
+
+  for stale_panel_ip in ${PANEL_STALE_IPS:-} $persisted_panel_ips; do
+    case "$stale_panel_ip" in
+      ''|*[!0-9.]*) continue ;;
+    esac
+    [ "$stale_panel_ip" = "$PANEL_IP" ] && continue
+    [ "$stale_panel_ip" = "$ROUTER_IP" ] && continue
+    if ip addr show br-lan 2>/dev/null | grep -Fq "inet $stale_panel_ip/"; then
+      ip addr del "$stale_panel_ip/24" dev br-lan 2>/dev/null || true
+      if ip addr show br-lan 2>/dev/null | grep -Fq "inet $stale_panel_ip/"; then
+        die "Не удалось удалить устаревший адрес панели $stale_panel_ip"
+      fi
+    fi
+  done
+}
+
 configure_panel_ip() {
   # Keep the router's primary LAN configuration byte-for-byte intact. A prior
   # installer rewrote network.lan.ipaddr as a list and reloaded all of netifd;
@@ -1102,6 +1162,11 @@ configure_panel_ip() {
   ROUTER_IP_RAW=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
   ROUTER_IP=$(printf '%s\n' "$ROUTER_IP_RAW" | awk '{print $1}' | cut -d'/' -f1)
   [ -n "$ROUTER_IP" ] || ROUTER_IP="192.168.1.1"
+  sync_panel_ip_to_lan "$ROUTER_IP" || {
+    warn "не удалось вычислить адрес панели из LAN $ROUTER_IP"
+    fallback_to_router_ip
+    return 0
+  }
 
   step "Доп. IP для панели: $PANEL_IP (основной: $ROUTER_IP)"
   if ! command -v uci >/dev/null 2>&1; then
@@ -1116,6 +1181,9 @@ configure_panel_ip() {
     uci -q delete network.lan_panel
     uci commit network
   fi
+
+  panel_hotplug="${PANEL_HOTPLUG_PATH:-/etc/hotplug.d/iface/99-space-link-panel-ip}"
+  remove_stale_panel_aliases "$panel_hotplug"
 
   main_present=0
   alias_present=0
@@ -1135,7 +1203,6 @@ configure_panel_ip() {
     # Persist the runtime alias without changing the LAN UCI package. netifd
     # invokes this after future LAN ifup events and the panel watchdog provides
     # a second non-disruptive repair path.
-    panel_hotplug="${PANEL_HOTPLUG_PATH:-/etc/hotplug.d/iface/99-space-link-panel-ip}"
     mkdir -p "$(dirname "$panel_hotplug")"
     cat > "$panel_hotplug" <<'HOOK'
 #!/bin/sh
@@ -1163,7 +1230,7 @@ HOOK
     /etc/init.d/uhttpd enable  >/dev/null 2>&1 || true
     /etc/init.d/uhttpd restart >/dev/null 2>&1 || /etc/init.d/uhttpd start >/dev/null 2>&1 || true
     sleep 1
-    if pgrep uhttpd >/dev/null 2>&1; then
+    if pidof uhttpd >/dev/null 2>&1; then
       ok "uhttpd (LuCI) запущен на http://$ROUTER_IP/ (bind only)"
     else
       warn "uhttpd не стартовал — LuCI недоступна, не критично"
@@ -1397,7 +1464,8 @@ clear_path() {
 }
 
 engine_ready() {
-  pgrep "^sing-box$" >/dev/null 2>&1 || return 1
+  # BusyBox pgrep -x checks the full argv; pidof checks the exact executable name.
+  pidof sing-box >/dev/null 2>&1 || return 1
   command -v netstat >/dev/null 2>&1 || return 1
   netstat -ln 2>/dev/null | grep -Eq '[:.]12345[[:space:]]'
 }
@@ -1445,8 +1513,8 @@ INITD
   cat > /etc/hotplug.d/firewall/99-space-link-tproxy <<'HOOK'
 #!/bin/sh
 # fw4 reload may remove the standalone table. Restore it only while the
-# health-gated path is armed and the destination listener still exists.
-if [ -f /etc/space-link/tproxy.armed ] && pgrep "^sing-box$" >/dev/null 2>&1; then
+# health-gated path is armed and the exact sing-box executable is still alive.
+if [ -f /etc/space-link/tproxy.armed ] && pidof sing-box >/dev/null 2>&1; then
   /etc/init.d/space-link-tproxy reload >/dev/null 2>&1 || /etc/init.d/space-link-tproxy stop >/dev/null 2>&1
 else
   /etc/init.d/space-link-tproxy stop >/dev/null 2>&1
@@ -1470,7 +1538,7 @@ traffic_engine_ready() {
   if [ -x /usr/bin/sing-box ]; then
     /usr/bin/sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1 || return 1
   fi
-  pgrep "^sing-box$" >/dev/null 2>&1 || return 1
+  pidof sing-box >/dev/null 2>&1 || return 1
   command -v netstat >/dev/null 2>&1 || return 1
   netstat -ln 2>/dev/null | grep -Eq '[:.]12345[[:space:]]' || return 1
 }
@@ -1556,13 +1624,16 @@ enable_services() {
   # sing-box — ставим минимальный direct-конфиг с локальным DNS-inbound.
   # Благодаря этому dnsmasq может безопасно использовать 127.0.0.42 даже до
   # выбора сервера; после выбора Go API заменит стаб полным конфигом.
+  # The DHCP transport retries every resolver advertised by the ISP instead
+  # of making fresh installs depend on one remote endpoint. Direct traffic is
+  # already ISP-visible, so local reachability is the honest privacy tradeoff.
   if [ ! -s /etc/sing-box/config.json ]; then
     mkdir -p /etc/sing-box
     if [ -f "$SCRIPT_DIR/../templates/sing-box-stub.json" ]; then
       cp "$SCRIPT_DIR/../templates/sing-box-stub.json" /etc/sing-box/config.json
     else
       fetch "$RELEASE_BASE/sing-box-stub.json" /etc/sing-box/config.json 2>/dev/null || \
-        printf '%s\n' '{"log":{"level":"warn"},"dns":{"servers":[{"tag":"direct-dns","address":"https://9.9.9.9/dns-query","detour":"direct"}],"final":"direct-dns"},"inbounds":[{"type":"direct","tag":"dns-in","listen":"127.0.0.42","listen_port":53,"sniff":true}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"default_domain_resolver":"direct-dns","final":"direct","rules":[{"protocol":"dns","action":"hijack-dns"}]}}' > /etc/sing-box/config.json
+        printf '%s\n' '{"log":{"level":"warn"},"dns":{"servers":[{"type":"dhcp","tag":"direct-dns"}],"final":"direct-dns"},"inbounds":[{"type":"direct","tag":"dns-in","listen":"127.0.0.42","listen_port":53,"sniff":true}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"auto_detect_interface":true,"default_domain_resolver":"direct-dns","final":"direct","rules":[{"protocol":"dns","action":"hijack-dns"}]}}' > /etc/sing-box/config.json
     fi
   fi
   # ---- sing-box capabilities ----------------------------------------------
@@ -1650,7 +1721,7 @@ CAP
   # освободился от предыдущей попытки. Даём 5 секунд + retry до 3 раз.
   for try in 1 2 3; do
     sleep 2
-    if pgrep -x lighttpd >/dev/null 2>&1; then
+    if pidof lighttpd >/dev/null 2>&1; then
       ok "lighttpd работает (try=$try)"
       break
     fi
@@ -1910,11 +1981,12 @@ _dns_sed_scrub() {
   sed -i '/list address.*my\.sapce\//d' /etc/config/dhcp 2>/dev/null || true
   sed -i '/list address.*spacelink\.lan/d' /etc/config/dhcp 2>/dev/null || true
   sed -i '/list address.*my\.spacelink/d' /etc/config/dhcp 2>/dev/null || true
+  sed -i '/list address.*panel\.home\.arpa\//d' /etc/config/dhcp 2>/dev/null || true
 }
 
 # Verify the process, exact authoritative UCI rules, and both IPv4 answers.
 _dns_verify() {
-  pgrep dnsmasq >/dev/null 2>&1 || return 1
+  pidof dnsmasq >/dev/null 2>&1 || return 1
   addrs=$(uci -q get dhcp.@dnsmasq[0].address 2>/dev/null || true)
   for expected in "/my.space/$EFFECTIVE_BIND" "/my.space/" "/my.sapce/$EFFECTIVE_BIND" "/my.sapce/" \
     "/panel.home.arpa/$EFFECTIVE_BIND" "/panel.home.arpa/"; do
@@ -1937,6 +2009,258 @@ install_panel_watchdog() {
   step "Установка watchdog панели"
   cat > /usr/bin/space-link-panel-watchdog <<'WATCHDOG'
 #!/bin/sh
+
+# A LAN ULA is useful only when the router can send IPv6 upstream. odhcpd
+# otherwise makes clients prefer unreachable AAAA answers, adding a timeout to
+# every connection. Keep the operator's exact modes in a private state file so
+# automatic suppression is reversible and never invents an enabled policy.
+ipv6_state_file=${IPV6_LAN_STATE_FILE:-/etc/space-link/lan-ipv6.restore}
+ipv6_odhcpd_init=${ODHCPD_INIT:-/etc/init.d/odhcpd}
+
+ipv6_log() {
+  logger -t space-link-ipv6-lan "$*" 2>/dev/null || true
+}
+
+ipv6_mode_is_supported() {
+  case "${1:-}" in
+    __unset__|server|relay|hybrid|disabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+ipv6_uci_get() {
+  ipv6_value=$(uci -q get "dhcp.lan.$1" 2>/dev/null) || ipv6_value="__unset__"
+  [ -n "$ipv6_value" ] || ipv6_value="__unset__"
+  printf '%s\n' "$ipv6_value"
+}
+
+read_ipv6_restore_state() {
+  ipv6_restore_ra=""
+  ipv6_restore_dhcpv6=""
+  ipv6_restore_ndp=""
+  ipv6_restore_applied=""
+  ipv6_seen_ra=0
+  ipv6_seen_dhcpv6=0
+  ipv6_seen_ndp=0
+  ipv6_seen_applied=0
+  ipv6_state_valid=1
+
+  while IFS='=' read -r ipv6_key ipv6_value; do
+    case "$ipv6_key" in
+      ra)
+        [ "$ipv6_seen_ra" = 0 ] || ipv6_state_valid=0
+        ipv6_restore_ra="$ipv6_value"
+        ipv6_seen_ra=1
+        ;;
+      dhcpv6)
+        [ "$ipv6_seen_dhcpv6" = 0 ] || ipv6_state_valid=0
+        ipv6_restore_dhcpv6="$ipv6_value"
+        ipv6_seen_dhcpv6=1
+        ;;
+      ndp)
+        [ "$ipv6_seen_ndp" = 0 ] || ipv6_state_valid=0
+        ipv6_restore_ndp="$ipv6_value"
+        ipv6_seen_ndp=1
+        ;;
+      applied)
+        [ "$ipv6_seen_applied" = 0 ] || ipv6_state_valid=0
+        ipv6_restore_applied="$ipv6_value"
+        ipv6_seen_applied=1
+        ;;
+      *) ipv6_state_valid=0 ;;
+    esac
+  done < "$ipv6_state_file"
+
+  [ "$ipv6_state_valid" = 1 ] || return 1
+  [ "$ipv6_seen_ra" = 1 ] || return 1
+  [ "$ipv6_seen_dhcpv6" = 1 ] || return 1
+  [ "$ipv6_seen_ndp" = 1 ] || return 1
+  [ "$ipv6_seen_applied" = 1 ] || return 1
+  ipv6_mode_is_supported "$ipv6_restore_ra" || return 1
+  ipv6_mode_is_supported "$ipv6_restore_dhcpv6" || return 1
+  ipv6_mode_is_supported "$ipv6_restore_ndp" || return 1
+  case "$ipv6_restore_applied" in 0|1) ;; *) return 1 ;; esac
+  return 0
+}
+
+write_ipv6_restore_state() {
+  ipv6_state_dir=${ipv6_state_file%/*}
+  [ "$ipv6_state_dir" != "$ipv6_state_file" ] || ipv6_state_dir="."
+  mkdir -p "$ipv6_state_dir" || return 1
+  ipv6_state_tmp="$ipv6_state_file.tmp.$$"
+  (
+    umask 077
+    {
+      printf 'ra=%s\n' "$ipv6_restore_ra"
+      printf 'dhcpv6=%s\n' "$ipv6_restore_dhcpv6"
+      printf 'ndp=%s\n' "$ipv6_restore_ndp"
+      printf 'applied=%s\n' "$ipv6_restore_applied"
+    } > "$ipv6_state_tmp"
+  ) || {
+    rm -f "$ipv6_state_tmp"
+    return 1
+  }
+  mv "$ipv6_state_tmp" "$ipv6_state_file"
+}
+
+restart_ipv6_advertiser() {
+  [ -x "$ipv6_odhcpd_init" ] || return 0
+  "$ipv6_odhcpd_init" restart >/dev/null 2>&1
+}
+
+disable_lan_ipv6() {
+  ipv6_current_ra=$(ipv6_uci_get ra)
+  ipv6_current_dhcpv6=$(ipv6_uci_get dhcpv6)
+  ipv6_current_ndp=$(ipv6_uci_get ndp)
+  for ipv6_mode in "$ipv6_current_ra" "$ipv6_current_dhcpv6" "$ipv6_current_ndp"; do
+    if ! ipv6_mode_is_supported "$ipv6_mode"; then
+      ipv6_log "неизвестный ручной режим IPv6 '$ipv6_mode'; настройки LAN оставлены без изменений"
+      return 1
+    fi
+  done
+
+  if [ -f "$ipv6_state_file" ]; then
+    if ! read_ipv6_restore_state; then
+      ipv6_log "файл восстановления IPv6 повреждён; настройки LAN оставлены без изменений"
+      return 1
+    fi
+  else
+    if [ "$ipv6_current_ra" = disabled ] \
+       && [ "$ipv6_current_dhcpv6" = disabled ] \
+       && [ "$ipv6_current_ndp" = disabled ]; then
+      # An already-disabled setup belongs to the operator, not this controller.
+      return 0
+    fi
+    ipv6_restore_ra="$ipv6_current_ra"
+    ipv6_restore_dhcpv6="$ipv6_current_dhcpv6"
+    ipv6_restore_ndp="$ipv6_current_ndp"
+    ipv6_restore_applied=0
+  fi
+
+  ipv6_needs_config=0
+  if [ "$ipv6_current_ra" != disabled ]; then
+    ipv6_restore_ra="$ipv6_current_ra"
+    ipv6_needs_config=1
+  fi
+  if [ "$ipv6_current_dhcpv6" != disabled ]; then
+    ipv6_restore_dhcpv6="$ipv6_current_dhcpv6"
+    ipv6_needs_config=1
+  fi
+  if [ "$ipv6_current_ndp" != disabled ]; then
+    ipv6_restore_ndp="$ipv6_current_ndp"
+    ipv6_needs_config=1
+  fi
+  if [ "$ipv6_needs_config" = 1 ]; then
+    # A hand edit during an outage becomes the value restored after recovery.
+    ipv6_restore_applied=0
+    write_ipv6_restore_state || return 1
+  fi
+
+  ipv6_set_failed=0
+  if [ "$ipv6_current_ra" != disabled ]; then
+    uci -q set dhcp.lan.ra=disabled >/dev/null 2>&1 || ipv6_set_failed=1
+  fi
+  if [ "$ipv6_current_dhcpv6" != disabled ]; then
+    uci -q set dhcp.lan.dhcpv6=disabled >/dev/null 2>&1 || ipv6_set_failed=1
+  fi
+  if [ "$ipv6_current_ndp" != disabled ]; then
+    uci -q set dhcp.lan.ndp=disabled >/dev/null 2>&1 || ipv6_set_failed=1
+  fi
+  [ "$ipv6_set_failed" = 0 ] || return 1
+
+  if [ "$ipv6_needs_config" = 1 ] || [ "$ipv6_restore_applied" != 1 ]; then
+    uci -q commit dhcp >/dev/null 2>&1 || return 1
+    restart_ipv6_advertiser || return 1
+    ipv6_restore_applied=1
+    write_ipv6_restore_state || return 1
+    ipv6_log "IPv6-аплинка нет; RA, DHCPv6 и NDP в LAN отключены"
+  fi
+  return 0
+}
+
+restore_lan_ipv6() {
+  [ -f "$ipv6_state_file" ] || return 0
+  if ! read_ipv6_restore_state; then
+    ipv6_log "файл восстановления IPv6 повреждён; ручные настройки не перезаписаны"
+    return 1
+  fi
+
+  ipv6_current_ra=$(ipv6_uci_get ra)
+  ipv6_current_dhcpv6=$(ipv6_uci_get dhcpv6)
+  ipv6_current_ndp=$(ipv6_uci_get ndp)
+  ipv6_restore_changed=0
+  ipv6_restore_failed=0
+
+  if [ "$ipv6_current_ra" = disabled ] && [ "$ipv6_restore_ra" != disabled ]; then
+    if [ "$ipv6_restore_ra" = __unset__ ]; then
+      uci -q delete dhcp.lan.ra >/dev/null 2>&1 || ipv6_restore_failed=1
+    else
+      uci -q set "dhcp.lan.ra=$ipv6_restore_ra" >/dev/null 2>&1 || ipv6_restore_failed=1
+    fi
+    ipv6_restore_changed=1
+  fi
+  if [ "$ipv6_current_dhcpv6" = disabled ] && [ "$ipv6_restore_dhcpv6" != disabled ]; then
+    if [ "$ipv6_restore_dhcpv6" = __unset__ ]; then
+      uci -q delete dhcp.lan.dhcpv6 >/dev/null 2>&1 || ipv6_restore_failed=1
+    else
+      uci -q set "dhcp.lan.dhcpv6=$ipv6_restore_dhcpv6" >/dev/null 2>&1 || ipv6_restore_failed=1
+    fi
+    ipv6_restore_changed=1
+  fi
+  if [ "$ipv6_current_ndp" = disabled ] && [ "$ipv6_restore_ndp" != disabled ]; then
+    if [ "$ipv6_restore_ndp" = __unset__ ]; then
+      uci -q delete dhcp.lan.ndp >/dev/null 2>&1 || ipv6_restore_failed=1
+    else
+      uci -q set "dhcp.lan.ndp=$ipv6_restore_ndp" >/dev/null 2>&1 || ipv6_restore_failed=1
+    fi
+    ipv6_restore_changed=1
+  fi
+  [ "$ipv6_restore_failed" = 0 ] || return 1
+
+  if [ "$ipv6_restore_changed" = 1 ]; then
+    uci -q commit dhcp >/dev/null 2>&1 || return 1
+  fi
+  # Retry a previously failed daemon apply even if UCI already has the values.
+  restart_ipv6_advertiser || return 1
+  rm -f "$ipv6_state_file" || return 1
+  ipv6_log "IPv6-аплинк появился; прежние настройки LAN восстановлены"
+  return 0
+}
+
+# A main-table forwarding default is the decisive signal. A global WAN address
+# without a default cannot reach the internet, while DHCPv6-PD may legitimately
+# use a link-local next hop, so requiring a global address would disable working
+# provider IPv6. Netlink errors are indeterminate and must never disable LAN v6.
+ipv6_default_route_state() {
+  ipv6_routes=$(ip -6 route show default 2>/dev/null) || return 2
+  printf '%s\n' "$ipv6_routes" | grep -q '^default[[:space:]]'
+}
+
+reevaluate_lan_ipv6() {
+  command -v uci >/dev/null 2>&1 || return 0
+  if ipv6_default_route_state; then
+    restore_lan_ipv6
+    return $?
+  else
+    ipv6_route_status=$?
+  fi
+  if [ "$ipv6_route_status" = 1 ]; then
+    disable_lan_ipv6
+    return $?
+  fi
+  ipv6_log "не удалось проверить IPv6-маршрут; настройки LAN оставлены без изменений"
+  return 0
+}
+
+if [ "${1:-}" = "--ipv6" ]; then
+  reevaluate_lan_ipv6
+  exit $?
+fi
+if [ "${1:-}" = "--ipv6-restore" ]; then
+  command -v uci >/dev/null 2>&1 || exit 0
+  restore_lan_ipv6
+  exit $?
+fi
 
 # procd runs this mode continuously. HTTP probes have bounded deadlines and
 # each check is a child process, so a failed check cannot exit the recovery
@@ -2043,20 +2367,18 @@ panel_url="http://$bind:$port/"
 [ "$port" = "80" ] && panel_url="http://$bind/"
 
 # A static index alone can look healthy while its proxied API is wedged. Probe
-# both loopback API and lighttpd on every cheap tick, then confirm the frontend
-# process still exists. Each HTTP request has its own two-second deadline.
+# both loopback API and lighttpd on every cheap tick. Each HTTP request has its
+# own two-second deadline, and the functional panel probe is authoritative:
+# a process-name false negative must never trigger a restart storm.
 api_url="http://127.0.0.1:8080/api/local/status"
 api_healthy=0
 panel_healthy=0
-lighttpd_healthy=0
 lighttpd_restarted=0
 http_ok "$api_url" && api_healthy=1
 panel_ok "$panel_url" && panel_healthy=1
-pgrep -x lighttpd >/dev/null 2>&1 && lighttpd_healthy=1
 if [ "${1:-}" != "--full" ] \
    && [ "$api_healthy" = "1" ] \
-   && [ "$panel_healthy" = "1" ] \
-   && [ "$lighttpd_healthy" = "1" ]; then
+   && [ "$panel_healthy" = "1" ]; then
   exit 0
 fi
 
@@ -2087,27 +2409,16 @@ case "$bind" in
     ;;
 esac
 
-if [ "$lighttpd_restarted" != "1" ]; then
-  if [ "$lighttpd_healthy" != "1" ]; then
-    restart_service lighttpd "process not running"
-    lighttpd_restarted=1
-    sleep 2
-  elif [ "$panel_healthy" != "1" ]; then
-    restart_service lighttpd "panel http check failed ($panel_url)"
-    lighttpd_restarted=1
-    sleep 2
-  fi
+if [ "$lighttpd_restarted" != "1" ] && [ "$panel_healthy" != "1" ]; then
+  restart_service lighttpd "panel http check failed ($panel_url)"
+  lighttpd_restarted=1
+  sleep 2
 fi
 
 # Re-probe only after a recovery action. A healthy full audit reuses the probe
-# above instead of curling the same panel twice.
+# above instead of curling the same panel twice. HTTP success proves both that
+# lighttpd is alive and that it serves the configured address.
 if [ "$lighttpd_restarted" = "1" ]; then
-  if ! pgrep -x lighttpd >/dev/null 2>&1; then
-    lighttpd_healthy=0
-    log "lighttpd still not running after restart"
-  else
-    lighttpd_healthy=1
-  fi
   if panel_ok "$panel_url"; then
     panel_healthy=1
   else
@@ -2123,6 +2434,12 @@ fi
 # they ran once a minute. Making them ten times rarer would have traded a
 # faster panel for a slower recovery of the thing people actually notice: no
 # names resolving, or traffic quietly leaving the tunnel.
+if [ "${1:-}" = "--full" ]; then
+  # One route lookup plus three UCI reads every ten minutes on IPv4-only WANs;
+  # steady state never commits flash or restarts odhcpd.
+  reevaluate_lan_ipv6 || log "не удалось синхронизировать IPv6 LAN с аплинком"
+fi
+
 if [ "${1:-}" = "--full" ] && command -v uci >/dev/null 2>&1 && command -v nslookup >/dev/null 2>&1; then
   aliases_ok=1
   canonical_ip=0
@@ -2182,7 +2499,8 @@ fi
 # nft-таблица заворота пропала (например не переподнялась после ребута) → трафик
 # Without the table, active VPN traffic leaks directly. The ten-minute full
 # audit rebuilds interception without adding work to every light panel tick.
-if [ -s /etc/space-link/active-server ] && pgrep sing-box >/dev/null 2>&1 \
+# BusyBox pgrep -x checks full argv; pidof checks the exact executable name.
+if [ -s /etc/space-link/active-server ] && pidof sing-box >/dev/null 2>&1 \
    && ! grep -q '"active":[[:space:]]*true' /etc/space-link/watchdog.json 2>/dev/null; then
   if command -v nft >/dev/null 2>&1 && ! nft list table inet space_link >/dev/null 2>&1; then
     log "TPROXY-таблица пропала при активном сервере — переподнимаю заворот трафика"
@@ -2197,7 +2515,7 @@ if command -v nft >/dev/null 2>&1; then
   resolver_ok=0
   if command -v nslookup >/dev/null 2>&1; then
     nslookup my.space 127.0.0.1 >/dev/null 2>&1 && resolver_ok=1
-  elif pgrep dnsmasq >/dev/null 2>&1; then
+  elif pidof dnsmasq >/dev/null 2>&1; then
     resolver_ok=1
   fi
   if [ "$resolver_ok" = "1" ]; then
@@ -2214,11 +2532,15 @@ fi
 
 [ "$api_healthy" = "1" ] \
   && [ "$panel_healthy" = "1" ] \
-  && [ "$lighttpd_healthy" = "1" ] \
   && exit 0
 exit 1
 WATCHDOG
   chmod 0755 /usr/bin/space-link-panel-watchdog
+  if /usr/bin/space-link-panel-watchdog --ipv6; then
+    ok "IPv6 LAN соответствует доступности аплинка"
+  else
+    warn "не удалось применить режим IPv6 LAN — watchdog повторит проверку"
+  fi
   ok "panel watchdog"
 }
 
@@ -2294,7 +2616,7 @@ final_summary() {
   printf '\n--- Диагностика ---\n'
 
   dns_ok=0
-  if pgrep dnsmasq >/dev/null 2>&1; then
+  if pidof dnsmasq >/dev/null 2>&1; then
     leases=0
     [ -r /tmp/dhcp.leases ] && leases=$(wc -l < /tmp/dhcp.leases 2>/dev/null || echo 0)
     printf '   DHCP/DNS:        OK  работает (%s аренд)\n' "$leases"
@@ -2313,14 +2635,14 @@ final_summary() {
   fi
 
   http_ok=0
-  if pgrep lighttpd >/dev/null 2>&1; then
+  if pidof lighttpd >/dev/null 2>&1; then
     printf '   lighttpd:        OK  работает\n'
     http_ok=1
   else
     printf '   lighttpd:        ERR не запущен — панель недоступна\n'
   fi
 
-  if pgrep "^sing-box$" >/dev/null 2>&1; then
+  if pidof sing-box >/dev/null 2>&1; then
     printf '   sing-box:        OK  работает\n'
   else
     printf '   sing-box:        --  не запущен (норма пока не выбран сервер)\n'
@@ -2328,7 +2650,7 @@ final_summary() {
 
   if [ "$EFFECTIVE_BIND" = "$router_ip" ]; then
     printf '   LuCI:            --  выключена (мы заняли :80 на %s)\n' "$router_ip"
-  elif pgrep uhttpd >/dev/null 2>&1; then
+  elif pidof uhttpd >/dev/null 2>&1; then
     printf '   LuCI:            OK  работает на http://%s/\n' "$router_ip"
   else
     printf '   LuCI:            ERR uhttpd не запущен (вручную: service uhttpd start)\n'
