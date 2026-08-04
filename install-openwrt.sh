@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.57"
+VERSION="0.3.58"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -38,15 +38,14 @@ PREVIOUS_LIGHTTPD_ENABLED=0
 PREVIOUS_LIGHTTPD_RUNNING=0
 PREVIOUS_TPROXY_ARMED=0
 
-# Где живёт наша панель. По умолчанию — alias-IP на LAN-интерфейсе чтобы
-# не конфликтовать с uhttpd (LuCI). Если alias не поднимется, упадём в
-# fallback (Вариант A): выключим uhttpd и займём :80 на основном IP.
-# IP подобран ВНЕ DHCP-пула OpenWrt (.100-.249) чтобы DHCP его не выдал клиенту.
-PANEL_IP="${PANEL_IP:-192.168.1.2}"
+# The panel is the .2 alias in the live LAN /24, outside OpenWrt's default
+# DHCP pool (.100-.249). It is intentionally unset until network.lan.ipaddr has
+# been read; no vendor-default prefix is allowed to become persisted state.
+PANEL_IP=""
 PANEL_PORT="${PANEL_PORT:-80}"
-# Реальные bind/port, на которых в итоге запустится lighttpd. Считаются после
-# configure_panel_ip; до этого = желаемому PANEL_IP/PANEL_PORT.
-EFFECTIVE_BIND="$PANEL_IP"
+# The actual lighttpd listener is resolved by configure_panel_ip. It normally
+# equals PANEL_IP, with the router's primary address used only as a safe fallback.
+EFFECTIVE_BIND=""
 EFFECTIVE_PORT="$PANEL_PORT"
 ROUTER_IP=""
 
@@ -1017,20 +1016,19 @@ pick_lan_prefix() {
 # every run: an earlier installer may already have moved network.lan while
 # leaving the panel consumers pinned to the vendor-default address.
 sync_panel_ip_to_lan() {
-  panel_lan_ip="${1:-}"
-  case "$panel_lan_ip" in
-    *.*.*.*) ;;
-    *) return 1 ;;
-  esac
-  panel_lan_prefix=$(printf '%s\n' "$panel_lan_ip" | cut -d. -f1-3)
-  panel_target_ip="${panel_lan_prefix}.2"
-
-  if [ "$PANEL_IP" != "$panel_target_ip" ]; then
-    case " ${PANEL_STALE_IPS:-} " in
-      *" $PANEL_IP "*) ;;
-      *) PANEL_STALE_IPS="${PANEL_STALE_IPS:+$PANEL_STALE_IPS }$PANEL_IP" ;;
-    esac
-  fi
+  panel_lan_ip="$(printf '%s\n' "${1:-}" | awk '{ print $1; exit }' | cut -d/ -f1)"
+  panel_target_ip="$(printf '%s\n' "$panel_lan_ip" | awk -F. '
+    NF != 4 { exit 1 }
+    {
+      for (i = 1; i <= 4; i++) {
+        if ($i !~ /^[0-9][0-9]*$/ || $i < 0 || $i > 255) {
+          exit 1
+        }
+      }
+      printf "%d.%d.%d.2\n", $1, $2, $3
+    }
+  ')" || return 1
+  [ -n "$panel_target_ip" ] || return 1
   PANEL_IP="$panel_target_ip"
   EFFECTIVE_BIND="$PANEL_IP"
 }
@@ -1133,16 +1131,50 @@ restore_dhcp_lease() {
 # Only addresses recorded by this installer are candidates for removal.
 remove_stale_panel_aliases() {
   stale_panel_hotplug="$1"
-  persisted_panel_ips=""
+  managed_panel_ips=""
   if [ -f "$stale_panel_hotplug" ]; then
-    persisted_panel_ips=$(sed -n 's|.*ip addr add "\([0-9][0-9.]*\)/24".*|\1|p' "$stale_panel_hotplug" 2>/dev/null || true)
+    managed_panel_ips="$managed_panel_ips $(sed -n 's|.*ip addr add "\([0-9][0-9.]*\)/24".*|\1|p' "$stale_panel_hotplug" 2>/dev/null || true)"
     rm -f "$stale_panel_hotplug" \
       || die "Не удалось отключить устаревший hotplug адреса панели"
   fi
 
-  for stale_panel_ip in ${PANEL_STALE_IPS:-} $persisted_panel_ips; do
+  panel_hosts="${PANEL_HOSTS_FILE:-/etc/hosts}"
+  if [ -f "$panel_hosts" ]; then
+    managed_panel_ips="$managed_panel_ips $(awk '
+      {
+        managed = ($0 ~ /# space-link-panel[[:space:]]*$/)
+        for (i = 2; i <= NF; i++) {
+          if ($i == "my.space" || $i == "my.sapce" ||
+              $i == "my.spacelink" || $i == "spacelink.lan" ||
+              $i == "panel.home.arpa") {
+            managed = 1
+          }
+        }
+        if (managed) print $1
+      }
+    ' "$panel_hosts" 2>/dev/null)"
+  fi
+
+  panel_lighttpd="${PANEL_LIGHTTPD_CONF:-/etc/lighttpd/conf.d/space-link.conf}"
+  if [ -f "$panel_lighttpd" ]; then
+    managed_panel_ips="$managed_panel_ips $(awk -F'"' '/server.bind/ { print $2; exit }' "$panel_lighttpd" 2>/dev/null)"
+  fi
+  if command -v uci >/dev/null 2>&1; then
+    for panel_record in $(uci -q get dhcp.@dnsmasq[0].address 2>/dev/null || true); do
+      case "$panel_record" in
+        */my.space/*|*/my.sapce/*|*/my.spacelink/*|*/spacelink.lan/*|*/panel.home.arpa/*)
+          managed_panel_ips="$managed_panel_ips ${panel_record##*/}"
+          ;;
+      esac
+    done
+  fi
+
+
+  for stale_panel_ip in $managed_panel_ips; do
     case "$stale_panel_ip" in
-      ''|*[!0-9.]*) continue ;;
+      ''|*[!0-9.]*|*.*.*.*.*) continue ;;
+      *.*.*.2) ;;
+      *) continue ;;
     esac
     [ "$stale_panel_ip" = "$PANEL_IP" ] && continue
     [ "$stale_panel_ip" = "$ROUTER_IP" ] && continue
@@ -1187,13 +1219,13 @@ configure_panel_ip() {
 
   main_present=0
   alias_present=0
-  ip addr show br-lan 2>/dev/null | grep -q "inet $ROUTER_IP/" && main_present=1
-  ip addr show br-lan 2>/dev/null | grep -q "inet $PANEL_IP/" && alias_present=1
+  ip addr show br-lan 2>/dev/null | grep -Fq "inet $ROUTER_IP/" && main_present=1
+  ip addr show br-lan 2>/dev/null | grep -Fq "inet $PANEL_IP/" && alias_present=1
   if [ "$alias_present" != "1" ]; then
     ip addr add "$PANEL_IP/24" dev br-lan 2>/dev/null || true
     sleep 1
-    ip addr show br-lan 2>/dev/null | grep -q "inet $PANEL_IP/" && alias_present=1
-    ip addr show br-lan 2>/dev/null | grep -q "inet $ROUTER_IP/" && main_present=1
+    ip addr show br-lan 2>/dev/null | grep -Fq "inet $PANEL_IP/" && alias_present=1
+    ip addr show br-lan 2>/dev/null | grep -Fq "inet $ROUTER_IP/" && main_present=1
   fi
 
   if [ "$main_present" = "1" ] && [ "$alias_present" = "1" ]; then
@@ -1204,21 +1236,18 @@ configure_panel_ip() {
     # invokes this after future LAN ifup events and the panel watchdog provides
     # a second non-disruptive repair path.
     mkdir -p "$(dirname "$panel_hotplug")"
-    cat > "$panel_hotplug" <<'HOOK'
-#!/bin/sh
-[ "${ACTION:-}" = "ifup" ] || exit 0
-[ "${INTERFACE:-}" = "lan" ] || exit 0
-ip addr show br-lan 2>/dev/null | grep -q "inet __PANEL_IP__/" \
-  || ip addr add "__PANEL_IP__/24" dev br-lan 2>/dev/null || true
-HOOK
     panel_hotplug_tmp="$panel_hotplug.tmp.$$"
-    if ! sed "s|__PANEL_IP__|$PANEL_IP|g" "$panel_hotplug" > "$panel_hotplug_tmp"; then
-      rm -f "$panel_hotplug_tmp"
-      die "Не удалось сохранить настройки адреса панели"
-    fi
+    cat > "$panel_hotplug_tmp" <<HOOK
+#!/bin/sh
+[ "\${ACTION:-}" = "ifup" ] || exit 0
+[ "\${INTERFACE:-}" = "lan" ] || exit 0
+ip addr show br-lan 2>/dev/null | grep -Fq "inet $PANEL_IP/" \
+  || ip addr add "$PANEL_IP/24" dev br-lan 2>/dev/null || true
+HOOK
+    chmod 0755 "$panel_hotplug_tmp" \
+      || { rm -f "$panel_hotplug_tmp"; die "Не удалось сохранить настройки адреса панели"; }
     mv "$panel_hotplug_tmp" "$panel_hotplug" \
       || die "Не удалось сохранить настройки адреса панели"
-    chmod 0755 "$panel_hotplug"
 
     ok "доп. IP $PANEL_IP/24 добавлен без перезапуска сети; основной $ROUTER_IP сохранён"
     uci -q delete uhttpd.main.listen_http  >/dev/null 2>&1 || true
@@ -1294,8 +1323,9 @@ configure_tproxy() {
   TPROXY_MARK="${TPROXY_MARK:-255}"
   TPROXY_TABLE="${TPROXY_TABLE:-100}"
 
-  # Anti-leak controls.
-  #   dns_tunnel — keep external port-53 traffic inside the protected path.
+  # Traffic controls.
+  #   dns_tunnel — retained as a persisted compatibility/diagnostic value;
+  #                the dedicated DNS-pinning table now owns external port 53.
   #   block_quic — optional troubleshooting switch only. Native applications
   #                such as YouTube do not reliably fall back from QUIC, so
   #                UDP/443 must be proxied by default rather than rejected.
@@ -1373,16 +1403,13 @@ configure_tproxy() {
   #    delete молча игнорится благодаря объявлению на первой строке.
   mkdir -p /etc/space-link 2>/dev/null || true
 
-  # DNS-leak тумблер: когда dns_tunnel=1, перехватываем исходящий из LAN
-  # DNS (порт 53 tcp+udp) в tproxy ДО private-исключений — иначе запрос к
-  # dnsmasq/роутеру (192.168.x.1:53) вернулся бы по `return` и ушёл мимо
-  # туннеля. sing-box ловит его на tproxy-инбаунде и гонит через dns-out.
-  DNS_RULE_V4=""
-  DNS_RULE_V6=""
-  if [ "$DNS_TUNNEL" = "1" ]; then
-    DNS_RULE_V4="iifname \"br-lan\" meta l4proto { tcp, udp } th dport 53 tproxy ip to :__TPROXY_PORT__ meta mark set __TPROXY_MARK__ accept"
-    DNS_RULE_V6="iifname \"br-lan\" meta l4proto { tcp, udp } th dport 53 tproxy ip6 to :__TPROXY_PORT__ meta mark set __TPROXY_MARK__ accept"
-  fi
+  # DNS pinning lives in the separate `space_link_dns` dstnat table and sends
+  # hardcoded port-53 clients to dnsmasq. This mangle hook runs before dstnat,
+  # so it must explicitly return DNS before the catch-all TPROXY rules below.
+  # When the watchdog removes a silent dnsmasq redirect, the same returns make
+  # the client's configured resolver fail open instead of entering sing-box.
+  DNS_RULE_V4="iifname \"br-lan\" meta l4proto { tcp, udp } meta nfproto ipv4 th dport 53 return"
+  DNS_RULE_V6="iifname \"br-lan\" meta l4proto { tcp, udp } meta nfproto ipv6 th dport 53 return"
 
   # QUIC тумблер: режем UDP/443 из LAN, чтобы браузеры откатились на TCP/TLS
   # (HTTP/2), который tproxy уверенно sniff'ит. Иначе часть HTTP/3-трафика
@@ -1424,8 +1451,8 @@ table inet space_link {
         ip6 daddr ::ffff:0:0/96   return
 
         fib daddr type local      return
-        # Перехватываем только DNS к внешним адресам. Запросы к LAN-адресу
-        # роутера должны дойти до dnsmasq; их TPROXY-перехват лишает клиентов DNS.
+        # DNS continues to the dedicated dnsmasq redirect, never to sing-box.
+        # Family-specific returns also preserve direct fail-open if it is down.
         ${DNS_RULE_V4}
         ${DNS_RULE_V6}
 
@@ -1901,8 +1928,41 @@ write_panel_hosts() {
   hosts_file="${PANEL_HOSTS_FILE:-/etc/hosts}"
   [ -f "$hosts_file" ] || return 0
   tmp="${hosts_file}.space-link.$$"
-  grep -v '# space-link-panel$' "$hosts_file" > "$tmp" 2>/dev/null || cp "$hosts_file" "$tmp"
+  if ! awk '
+    /# space-link-panel[[:space:]]*$/ { next }
+    {
+      owned = 0
+      kept = 0
+      rebuilt = $1
+      for (i = 2; i <= NF; i++) {
+        if (substr($i, 1, 1) == "#") {
+          for (j = i; j <= NF; j++) rebuilt = rebuilt " " $j
+          break
+        }
+        if ($i == "my.space" || $i == "my.sapce" ||
+            $i == "my.spacelink" || $i == "spacelink.lan" ||
+            $i == "panel.home.arpa") {
+          owned = 1
+          continue
+        }
+        rebuilt = rebuilt " " $i
+        kept = 1
+      }
+      if (owned) {
+        if (kept) print rebuilt
+        next
+      }
+      print
+    }
+  ' "$hosts_file" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
   printf '%s my.space my.sapce panel.home.arpa # space-link-panel\n' "$EFFECTIVE_BIND" >> "$tmp"
+  if cmp -s "$tmp" "$hosts_file" 2>/dev/null; then
+    rm -f "$tmp"
+    return 0
+  fi
   mv "$tmp" "$hosts_file"
 }
 
@@ -2016,6 +2076,11 @@ install_panel_watchdog() {
 # automatic suppression is reversible and never invents an enabled policy.
 ipv6_state_file=${IPV6_LAN_STATE_FILE:-/etc/space-link/lan-ipv6.restore}
 ipv6_odhcpd_init=${ODHCPD_INIT:-/etc/init.d/odhcpd}
+panel_hosts_file=${PANEL_HOSTS_FILE:-/etc/hosts}
+panel_hotplug_file=${PANEL_HOTPLUG_PATH:-/etc/hotplug.d/iface/99-space-link-panel-ip}
+panel_lighttpd_conf=${PANEL_LIGHTTPD_CONF:-/etc/lighttpd/conf.d/space-link.conf}
+panel_target_cache=${PANEL_TARGET_CACHE:-/tmp/space-link-panel-watchdog.target}
+
 
 ipv6_log() {
   logger -t space-link-ipv6-lan "$*" 2>/dev/null || true
@@ -2342,10 +2407,230 @@ restart_api() {
   log "could not signal the space-link API process"
   return 1
 }
+# network.lan.ipaddr is authoritative. Every persisted panel consumer is
+# rewritten from the .2 address in that live /24 during a full audit.
+panel_target_from_lan() {
+  panel_lan_raw="$(uci -q get network.lan.ipaddr 2>/dev/null)" || return 1
+  panel_lan_ip="$(printf '%s\n' "$panel_lan_raw" | awk '{ print $1; exit }' | cut -d/ -f1)"
+  printf '%s\n' "$panel_lan_ip" | awk -F. '
+    NF != 4 { exit 1 }
+    {
+      for (i = 1; i <= 4; i++) {
+        if ($i !~ /^[0-9][0-9]*$/ || $i < 0 || $i > 255) {
+          exit 1
+        }
+      }
+      printf "%d.%d.%d.2\n", $1, $2, $3
+    }
+  '
+}
+
+panel_remember_managed_alias() {
+  panel_candidate="${1:-}"
+  case "$panel_candidate" in
+    ''|*[!0-9.]*|*.*.*.*.*) return 0 ;;
+    *.*.*.2) ;;
+    *) return 0 ;;
+  esac
+  case " $panel_managed_aliases " in
+    *" $panel_candidate "*) ;;
+    *) panel_managed_aliases="${panel_managed_aliases:+$panel_managed_aliases }$panel_candidate" ;;
+  esac
+}
+
+panel_collect_managed_aliases() {
+  panel_managed_aliases=""
+  if [ -f "$panel_hotplug_file" ]; then
+    for panel_candidate in $(sed -n 's|.*ip addr add "\([0-9][0-9.]*\)/24".*|\1|p' "$panel_hotplug_file" 2>/dev/null); do
+      panel_remember_managed_alias "$panel_candidate"
+    done
+  fi
+  if [ -f "$panel_hosts_file" ]; then
+    for panel_candidate in $(awk '
+      {
+        managed = ($0 ~ /# space-link-panel[[:space:]]*$/)
+        for (i = 2; i <= NF; i++) {
+          if ($i == "my.space" || $i == "my.sapce" ||
+              $i == "my.spacelink" || $i == "spacelink.lan" ||
+              $i == "panel.home.arpa") {
+            managed = 1
+          }
+        }
+        if (managed) print $1
+      }
+    ' "$panel_hosts_file" 2>/dev/null); do
+      panel_remember_managed_alias "$panel_candidate"
+    done
+  fi
+  if [ -f "$panel_lighttpd_conf" ]; then
+    panel_candidate="$(awk -F'"' '/server.bind/ { print $2; exit }' "$panel_lighttpd_conf" 2>/dev/null)"
+    panel_remember_managed_alias "$panel_candidate"
+  fi
+  if command -v uci >/dev/null 2>&1; then
+    for panel_record in $(uci -q get dhcp.@dnsmasq[0].address 2>/dev/null || true); do
+      case "$panel_record" in
+        */my.space/*|*/my.sapce/*|*/my.spacelink/*|*/spacelink.lan/*|*/panel.home.arpa/*)
+          panel_remember_managed_alias "${panel_record##*/}"
+          ;;
+      esac
+    done
+  fi
+}
+
+# Return 0 when replaced, 1 when already identical, and 2 on write failure.
+panel_replace_file() {
+  panel_candidate_file="$1"
+  panel_destination_file="$2"
+  if [ -f "$panel_destination_file" ] \
+     && cmp -s "$panel_candidate_file" "$panel_destination_file" 2>/dev/null; then
+    rm -f "$panel_candidate_file"
+    return 1
+  fi
+  if mv "$panel_candidate_file" "$panel_destination_file"; then
+    return 0
+  fi
+  rm -f "$panel_candidate_file"
+  return 2
+}
+
+panel_write_hosts() {
+  [ -f "$panel_hosts_file" ] || return 0
+  panel_tmp="${panel_hosts_file}.space-link.$$"
+  if ! awk '
+    /# space-link-panel[[:space:]]*$/ { next }
+    {
+      owned = 0
+      kept = 0
+      rebuilt = $1
+      for (i = 2; i <= NF; i++) {
+        if (substr($i, 1, 1) == "#") {
+          for (j = i; j <= NF; j++) rebuilt = rebuilt " " $j
+          break
+        }
+        if ($i == "my.space" || $i == "my.sapce" ||
+            $i == "my.spacelink" || $i == "spacelink.lan" ||
+            $i == "panel.home.arpa") {
+          owned = 1
+          continue
+        }
+        rebuilt = rebuilt " " $i
+        kept = 1
+      }
+      if (owned) {
+        if (kept) print rebuilt
+        next
+      }
+      print
+    }
+  ' "$panel_hosts_file" > "$panel_tmp"; then
+    rm -f "$panel_tmp"
+    return 1
+  fi
+  printf '%s my.space my.sapce panel.home.arpa # space-link-panel\n' "$panel_target" >> "$panel_tmp"
+  if panel_replace_file "$panel_tmp" "$panel_hosts_file"; then
+    panel_files_changed=1
+  else
+    panel_replace_status=$?
+    [ "$panel_replace_status" = "1" ] || return 1
+  fi
+}
+
+panel_write_lighttpd_bind() {
+  [ -f "$panel_lighttpd_conf" ] || return 0
+  panel_tmp="${panel_lighttpd_conf}.space-link.$$"
+  if ! awk -v target="$panel_target" '
+    BEGIN { written = 0 }
+    /^[[:space:]]*server\.bind[[:space:]]*=/ {
+      if (!written) print "server.bind = \"" target "\""
+      written = 1
+      next
+    }
+    { print }
+    END {
+      if (!written) print "server.bind = \"" target "\""
+    }
+  ' "$panel_lighttpd_conf" > "$panel_tmp"; then
+    rm -f "$panel_tmp"
+    return 1
+  fi
+  if panel_replace_file "$panel_tmp" "$panel_lighttpd_conf"; then
+    panel_files_changed=1
+    panel_restart_lighttpd=1
+  else
+    panel_replace_status=$?
+    [ "$panel_replace_status" = "1" ] || return 1
+  fi
+}
+
+panel_write_hotplug() {
+  panel_hotplug_dir="${panel_hotplug_file%/*}"
+  [ "$panel_hotplug_dir" != "$panel_hotplug_file" ] || panel_hotplug_dir="."
+  mkdir -p "$panel_hotplug_dir" || return 1
+  panel_tmp="${panel_hotplug_file}.space-link.$$"
+  cat > "$panel_tmp" <<PANEL_HOTPLUG
+#!/bin/sh
+[ "\${ACTION:-}" = "ifup" ] || exit 0
+[ "\${INTERFACE:-}" = "lan" ] || exit 0
+ip addr show br-lan 2>/dev/null | grep -Fq "inet $panel_target/" \
+  || ip addr add "$panel_target/24" dev br-lan 2>/dev/null || true
+PANEL_HOTPLUG
+  chmod 0755 "$panel_tmp" || { rm -f "$panel_tmp"; return 1; }
+  if panel_replace_file "$panel_tmp" "$panel_hotplug_file"; then
+    panel_files_changed=1
+  else
+    panel_replace_status=$?
+    [ "$panel_replace_status" = "1" ] || return 1
+    chmod 0755 "$panel_hotplug_file" 2>/dev/null || true
+  fi
+}
+
+panel_sync_address() {
+  panel_target="$(panel_target_from_lan)" || {
+    log "cannot derive panel address from network.lan.ipaddr; retaining current address"
+    return 1
+  }
+  panel_router_raw="$(uci -q get network.lan.ipaddr 2>/dev/null)" || return 1
+  panel_router_ip="$(printf '%s\n' "$panel_router_raw" | awk '{ print $1; exit }' | cut -d/ -f1)"
+  panel_collect_managed_aliases
+
+  if ! ip addr show br-lan 2>/dev/null | grep -Fq "inet $panel_target/"; then
+    ip addr add "$panel_target/24" dev br-lan 2>/dev/null || true
+    if ! ip addr show br-lan 2>/dev/null | grep -Fq "inet $panel_target/"; then
+      log "cannot add panel address $panel_target to br-lan; retaining current address"
+      return 1
+    fi
+    panel_restart_lighttpd=1
+  fi
+
+  panel_files_changed=0
+  panel_write_hosts || return 1
+  panel_write_lighttpd_bind || return 1
+  panel_write_hotplug || return 1
+
+  for panel_stale in $panel_managed_aliases; do
+    [ "$panel_stale" = "$panel_target" ] && continue
+    [ "$panel_stale" = "$panel_router_ip" ] && continue
+    if ip addr show br-lan 2>/dev/null | grep -Fq "inet $panel_stale/"; then
+      ip addr del "$panel_stale/24" dev br-lan 2>/dev/null || true
+    fi
+  done
+
+  if [ "$panel_files_changed" = "1" ]; then
+    rm -f "$panel_target_cache"
+    log "panel address synchronized to $panel_target from network.lan.ipaddr"
+  fi
+  return 0
+}
 
 
-conf="/etc/lighttpd/conf.d/space-link.conf"
-target_cache="/tmp/space-link-panel-watchdog.target"
+
+panel_restart_lighttpd=0
+if [ "${1:-}" = "--full" ] && command -v uci >/dev/null 2>&1; then
+  panel_sync_address || log "panel address audit could not converge"
+fi
+
+conf="$panel_lighttpd_conf"
+target_cache="$panel_target_cache"
 bind=""
 port=""
 # Config parsing needs two awk processes, so reuse the RAM-backed result on the
@@ -2359,7 +2644,8 @@ fi
 if [ -z "$bind" ] || [ -z "$port" ]; then
   bind="$(awk -F'"' '/server.bind/ { print $2; exit }' "$conf" 2>/dev/null)"
   port="$(awk '/server.port/ { print $3; exit }' "$conf" 2>/dev/null)"
-  [ -n "$bind" ] || bind="$(uci -q get network.lan.ipaddr 2>/dev/null || echo 192.168.1.1)"
+  [ -n "$bind" ] || bind="$(uci -q get network.lan.ipaddr 2>/dev/null | awk '{ print $1; exit }' | cut -d/ -f1)"
+  [ -n "$bind" ] || bind="192.168.1.1"
   [ -n "$port" ] || port="80"
   printf '%s\n%s\n' "$bind" "$port" > "$target_cache"
 fi
@@ -2374,6 +2660,11 @@ api_url="http://127.0.0.1:8080/api/local/status"
 api_healthy=0
 panel_healthy=0
 lighttpd_restarted=0
+if [ "$panel_restart_lighttpd" = "1" ]; then
+  restart_service lighttpd "panel address changed to $bind"
+  lighttpd_restarted=1
+  sleep 2
+fi
 http_ok "$api_url" && api_healthy=1
 panel_ok "$panel_url" && panel_healthy=1
 if [ "${1:-}" != "--full" ] \
@@ -2399,7 +2690,7 @@ fi
 case "$bind" in
   127.*|"") ;;
   *)
-    if ! ip addr show br-lan 2>/dev/null | grep -q "inet $bind/"; then
+    if ! ip addr show br-lan 2>/dev/null | grep -Fq "inet $bind/"; then
       log "панельный IP $bind не поднят на br-lan — добавляю и перезапускаю lighttpd"
       ip addr add "$bind/24" dev br-lan 2>/dev/null || true
       restart_service lighttpd "panel IP $bind was missing after boot"
@@ -2446,6 +2737,8 @@ if [ "${1:-}" = "--full" ] && command -v uci >/dev/null 2>&1 && command -v nsloo
   canonical_local=0
   typo_ip=0
   typo_local=0
+  home_ip=0
+  home_local=0
   addrs="$(uci -q get dhcp.@dnsmasq[0].address 2>/dev/null || true)"
   for a in $addrs; do
     case "$a" in
@@ -2453,21 +2746,25 @@ if [ "${1:-}" = "--full" ] && command -v uci >/dev/null 2>&1 && command -v nsloo
       "/my.space/") canonical_local=$((canonical_local + 1)) ;;
       "/my.sapce/$bind") typo_ip=$((typo_ip + 1)) ;;
       "/my.sapce/") typo_local=$((typo_local + 1)) ;;
-      */my.space/*|*/my.sapce/*|*/spacelink.lan/*|*/my.spacelink/*) aliases_ok=0 ;;
+      "/panel.home.arpa/$bind") home_ip=$((home_ip + 1)) ;;
+      "/panel.home.arpa/") home_local=$((home_local + 1)) ;;
+      */my.space/*|*/my.sapce/*|*/spacelink.lan/*|*/my.spacelink/*|*/panel.home.arpa/*) aliases_ok=0 ;;
     esac
   done
   [ "$canonical_ip" = "1" ] || aliases_ok=0
   [ "$canonical_local" = "1" ] || aliases_ok=0
   [ "$typo_ip" = "1" ] || aliases_ok=0
   [ "$typo_local" = "1" ] || aliases_ok=0
-  for host in my.space my.sapce; do
-    nslookup "$host" 127.0.0.1 2>/dev/null | grep -q "$bind" || aliases_ok=0
+  [ "$home_ip" = "1" ] || aliases_ok=0
+  [ "$home_local" = "1" ] || aliases_ok=0
+  for host in my.space my.sapce panel.home.arpa; do
+    nslookup "$host" 127.0.0.1 2>/dev/null | grep -Fq "$bind" || aliases_ok=0
   done
   if [ "$aliases_ok" != "1" ]; then
     log "panel DNS aliases are stale or non-authoritative; normalizing to $bind"
     for a in $addrs; do
       case "$a" in
-        */my.space/*|*/my.sapce/*|*/spacelink.lan/*|*/my.spacelink/*)
+        */my.space/*|*/my.sapce/*|*/spacelink.lan/*|*/my.spacelink/*|*/panel.home.arpa/*)
           uci -q del_list dhcp.@dnsmasq[0].address="$a" >/dev/null 2>&1 || true
           ;;
       esac
@@ -2476,6 +2773,8 @@ if [ "${1:-}" = "--full" ] && command -v uci >/dev/null 2>&1 && command -v nsloo
     uci -q add_list dhcp.@dnsmasq[0].address="/my.space/" >/dev/null 2>&1 || true
     uci -q add_list dhcp.@dnsmasq[0].address="/my.sapce/$bind" >/dev/null 2>&1 || true
     uci -q add_list dhcp.@dnsmasq[0].address="/my.sapce/" >/dev/null 2>&1 || true
+    uci -q add_list dhcp.@dnsmasq[0].address="/panel.home.arpa/$bind" >/dev/null 2>&1 || true
+    uci -q add_list dhcp.@dnsmasq[0].address="/panel.home.arpa/" >/dev/null 2>&1 || true
     uci -q commit dhcp >/dev/null 2>&1 || true
     /etc/init.d/dnsmasq reload >/dev/null 2>&1 || /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
   fi
