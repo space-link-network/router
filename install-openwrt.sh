@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.59"
+VERSION="0.3.60"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -1660,7 +1660,7 @@ enable_services() {
       cp "$SCRIPT_DIR/../templates/sing-box-stub.json" /etc/sing-box/config.json
     else
       fetch "$RELEASE_BASE/sing-box-stub.json" /etc/sing-box/config.json 2>/dev/null || \
-        printf '%s\n' '{"log":{"level":"warn"},"dns":{"servers":[{"type":"dhcp","tag":"direct-dns"}],"final":"direct-dns"},"inbounds":[{"type":"direct","tag":"dns-in","listen":"127.0.0.42","listen_port":53,"sniff":true}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"auto_detect_interface":true,"default_domain_resolver":"direct-dns","final":"direct","rules":[{"protocol":"dns","action":"hijack-dns"}]}}' > /etc/sing-box/config.json
+        printf '%s\n' '{"log":{"level":"warn"},"dns":{"servers":[{"type":"udp","tag":"direct-dns","server":"127.0.0.1","server_port":53}],"final":"direct-dns"},"inbounds":[{"type":"direct","tag":"dns-in","listen":"127.0.0.42","listen_port":53,"sniff":true}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"auto_detect_interface":true,"default_domain_resolver":"direct-dns","final":"direct","rules":[{"protocol":"dns","action":"hijack-dns"}]}}' > /etc/sing-box/config.json
     fi
   fi
   # ---- sing-box capabilities ----------------------------------------------
