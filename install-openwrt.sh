@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.58"
+VERSION="0.3.59"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -1966,6 +1966,33 @@ write_panel_hosts() {
   mv "$tmp" "$hosts_file"
 }
 
+# Every install and update ends here, and the panel must answer immediately —
+# not after the watchdog's ten-minute full audit. dnsmasq parses /etc/hosts
+# only at startup and configure_dns already restarted it before the panel
+# records were written, so an update that moves the panel leaves the name
+# pointing at the previous address for the rest of the boot. Reload
+# unconditionally: it costs one signal, and skipping it on "nothing changed"
+# is exactly how a half-migrated router keeps serving a dead address.
+bring_panel_up() {
+  step "Проверка панели"
+  /etc/init.d/dnsmasq reload >/dev/null 2>&1 \
+    || /etc/init.d/dnsmasq restart >/dev/null 2>&1 \
+    || true
+
+  panel_probe=1
+  while [ "$panel_probe" -le 5 ]; do
+    if wget -q -O /dev/null --timeout=3 "http://$EFFECTIVE_BIND/" 2>/dev/null; then
+      ok "панель отвечает на http://$EFFECTIVE_BIND/"
+      return 0
+    fi
+    /etc/init.d/lighttpd restart >/dev/null 2>&1 || true
+    sleep 2
+    panel_probe=$((panel_probe + 1))
+  done
+
+  warn "панель не ответила на http://$EFFECTIVE_BIND/ — watchdog продолжит поднимать её"
+  return 0
+}
 
 # Remove every current or legacy rule owned by Space Link. Matching the values
 # already present is what removes unknown stale IPs; the fixed candidate list
@@ -2617,6 +2644,13 @@ panel_sync_address() {
 
   if [ "$panel_files_changed" = "1" ]; then
     rm -f "$panel_target_cache"
+    # /etc/hosts is only parsed by dnsmasq at startup, so the new panel
+    # address stays invisible to every LAN client until dnsmasq is told to
+    # re-read it. Without this the audit fixes the files and the name still
+    # resolves to the previous prefix.
+    /etc/init.d/dnsmasq reload >/dev/null 2>&1 \
+      || /etc/init.d/dnsmasq restart >/dev/null 2>&1 \
+      || true
     log "panel address synchronized to $panel_target from network.lan.ipaddr"
   fi
   return 0
@@ -3041,6 +3075,7 @@ enable_services
 configure_dns
 configure_protected_dns
 write_panel_hosts
+bring_panel_up
 apply_dns_pinning
 activate_traffic_path
 install_cron
