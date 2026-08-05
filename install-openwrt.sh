@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.61"
+VERSION="0.3.62"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -920,13 +920,18 @@ install_ui() {
 
 install_rules() {
   step "Установка пресетов маршрутизации"
-  mkdir -p "$RULES_DIR/presets"
+  mkdir -p "$RULES_DIR/presets" "$RULES_DIR/presets/ip"
   if [ -d "$SCRIPT_DIR/../rules/presets" ]; then
     cp "$SCRIPT_DIR/../rules/presets"/*.txt "$RULES_DIR/presets/" 2>/dev/null || true
+    cp "$SCRIPT_DIR/../rules/presets/ip/"*.txt "$RULES_DIR/presets/ip/" 2>/dev/null || true
   else
     for preset in ru cis ai social stores crypto ads twitch-ads win-spy torrent; do
       fetch "$RELEASE_BASE/rules-$preset.txt" "$RULES_DIR/presets/$preset.txt" 2>/dev/null \
         || warn "пресет $preset не скачался — не критично, можно выбрать позже"
+    done
+    for preset in telegram; do
+      fetch "$RELEASE_BASE/rules-ip-$preset.txt" "$RULES_DIR/presets/ip/$preset.txt" 2>/dev/null \
+        || warn "пресет адресов $preset не скачался — не критично, можно выбрать позже"
     done
   fi
   ok "$RULES_DIR"
