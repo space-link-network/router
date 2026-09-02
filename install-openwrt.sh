@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.65"
+VERSION="0.3.66"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -3012,7 +3012,9 @@ final_summary() {
     printf '   HTTPS:           --  not configured; HTTPS cannot redirect before a TLS handshake, use http://my.space/\n'
   fi
 
-  if command -v nft >/dev/null 2>&1 && nft list table inet space_link >/dev/null 2>&1; then
+  if [ ! -s /etc/space-link/active-server ]; then
+    printf '   TPROXY:          --  сервер не выбран — интернет работает напрямую\n'
+  elif command -v nft >/dev/null 2>&1 && nft list table inet space_link >/dev/null 2>&1; then
     dnst=$(uci -q get space-link.tproxy.dns_tunnel 2>/dev/null || echo 0)
     quic=$(uci -q get space-link.tproxy.block_quic 2>/dev/null || echo 0)
     dns_lbl="выкл"; [ "$dnst" = "1" ] && dns_lbl="вкл"
