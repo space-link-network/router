@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.69"
+VERSION="0.3.70"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -57,7 +57,7 @@ REQUIRED_PKGS="ca-certificates curl lighttpd lighttpd-mod-proxy lighttpd-mod-rew
 # панель/домен всё равно поднялись; движок можно доустановить позже.
 ENGINE_PKGS="sing-box"
 # Optional pkgs — install if available, warn-only on failure.
-OPTIONAL_PKGS="kmod-tun"
+OPTIONAL_PKGS="kmod-tun kmod-usb3 kmod-usb-storage kmod-usb-storage-uas usbutils block-mount luci-app-fstab kmod-fs-ext4 ntfs-3g kmod-fs-vfat kmod-fs-exfat samba4-server luci-app-samba4 minidlna luci-app-minidlna"
 
 # Resolve script dir so the bundled installer (run from a worktree or
 # /tmp extraction) can find ./lib and ./templates. When piped via wget,
@@ -458,6 +458,139 @@ prompt_token() {
   else
     printf 'Пропущено. Открой http://my.space/ и введи токен или ссылку подписки в Setup.\n'
   fi
+}
+
+# ---- first-install WiFi setup ----------------------------------------------
+WIFI_SSID_CHOICE=0
+WIFI_PASSWORD_MODE=0
+WIFI_SSID_2G=""
+WIFI_SSID_5G=""
+WIFI_PASSWORD=""
+WIFI_CHANGED=0
+
+prompt_wifi() {
+  [ "$mode" = "first_install" ] || return 0
+
+  if [ -t 0 ]; then
+    _tty_in="/dev/stdin"
+  elif [ -r /dev/tty ]; then
+    _tty_in="/dev/tty"
+  else
+    printf '\nНет терминала для настройки Wi-Fi. Открой http://my.space/ и настрой Wi-Fi в панели управления.\n'
+    return 0
+  fi
+
+  printf '\nУстановить название сети Wi-Fi? [0] Оставить как есть  [1] Установить SLink-XXXXXX: '
+  read -r WIFI_SSID_CHOICE < "$_tty_in" || WIFI_SSID_CHOICE=0
+  case "$WIFI_SSID_CHOICE" in 1) ;; *) WIFI_SSID_CHOICE=0 ;; esac
+  printf 'Установить пароль Wi-Fi? [0] Оставить как есть  [1] Стандартный (12345678)  [2] Случайный: '
+  read -r WIFI_PASSWORD_MODE < "$_tty_in" || WIFI_PASSWORD_MODE=0
+  case "$WIFI_PASSWORD_MODE" in 1|2) ;; *) WIFI_PASSWORD_MODE=0 ;; esac
+}
+
+wifi_ssid_suffix() {
+  wifi_mac=$(printf '%s' "$1" | tr -d ':' | tr 'a-f' 'A-F')
+  [ "${#wifi_mac}" = 12 ] || return 1
+  case "$wifi_mac" in *[!0-9A-F]*) return 1 ;; esac
+  printf '%s\n' "${wifi_mac#??????}"
+}
+
+wifi_primary_ifaces() {
+  # Match the panel: the lexically first AP referencing each wifi-device is
+  # its primary interface. Section order and radio numbering do not imply band.
+  uci -q show wireless 2>/dev/null | LC_ALL=C awk '
+    {
+      equal = index($0, "=")
+      if (!equal) next
+      path = substr($0, 1, equal - 1)
+      value = substr($0, equal + 1)
+      sub(/^\047/, "", value)
+      sub(/\047$/, "", value)
+      if (sub(/^wireless\./, "", path) != 1) next
+      dot = index(path, ".")
+      if (!dot) { kind[path] = value; next }
+      section = substr(path, 1, dot - 1)
+      option = substr(path, dot + 1)
+      if (option == "device") device[section] = value
+      if (option == "mode") mode[section] = value
+      if (option == "band") band[section] = value
+    }
+    END {
+      for (iface in kind) {
+        radio = device[iface]
+        if (kind[iface] != "wifi-iface" || mode[iface] != "ap" || radio == "") continue
+        if (!(radio in primary) || iface < primary[radio]) primary[radio] = iface
+      }
+      for (radio in primary) {
+        if (kind[radio] == "wifi-device" && (band[radio] == "2g" || band[radio] == "5g"))
+          print band[radio], primary[radio]
+      }
+    }
+  ' | LC_ALL=C sort
+}
+
+apply_wifi_setup() {
+  [ "$mode" = "first_install" ] || return 0
+  [ "$WIFI_SSID_CHOICE" = 1 ] || [ "$WIFI_PASSWORD_MODE" = 1 ] \
+    || [ "$WIFI_PASSWORD_MODE" = 2 ] || return 0
+
+  wifi_ifaces=$(wifi_primary_ifaces)
+  if [ -z "$wifi_ifaces" ]; then
+    warn "Сети Wi-Fi не найдены — настрой Wi-Fi в панели: http://my.space/"
+    return 0
+  fi
+
+  wifi_base_ssid=""
+  if [ "$WIFI_SSID_CHOICE" = 1 ]; then
+    wifi_mac_address=$(cat /sys/class/net/br-lan/address 2>/dev/null || true)
+    if wifi_suffix=$(wifi_ssid_suffix "$wifi_mac_address"); then
+      wifi_base_ssid="SLink-$wifi_suffix"
+    else
+      warn "Не удалось прочитать MAC br-lan — название Wi-Fi оставлено как есть"
+    fi
+  fi
+  wifi_new_password=""
+  case "$WIFI_PASSWORD_MODE" in
+    1) wifi_new_password="12345678" ;;
+    2)
+      wifi_new_password=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | dd bs=1 count=16 2>/dev/null)
+      [ "${#wifi_new_password}" = 16 ] || die "Не удалось сгенерировать пароль Wi-Fi"
+      ;;
+  esac
+
+  while read -r wifi_band wifi_iface; do
+    if [ -n "$wifi_base_ssid" ]; then
+      wifi_new_ssid="$wifi_base_ssid"
+      [ "$wifi_band" != 5g ] || wifi_new_ssid="$wifi_base_ssid-5G"
+      uci set "wireless.$wifi_iface.ssid=$wifi_new_ssid" \
+        || die "Не удалось установить название Wi-Fi"
+      case "$wifi_band" in
+        2g) WIFI_SSID_2G="$wifi_new_ssid" ;;
+        5g) WIFI_SSID_5G="$wifi_new_ssid" ;;
+      esac
+      WIFI_CHANGED=1
+    fi
+    if [ -n "$wifi_new_password" ]; then
+      wifi_security=$(uci -q get "wireless.$wifi_iface.encryption" 2>/dev/null || true)
+      wifi_security=$(printf '%s' "$wifi_security" | tr 'A-Z' 'a-z' | tr -d '[:space:]')
+      uci set "wireless.$wifi_iface.key=$wifi_new_password" \
+        || die "Не удалось установить пароль Wi-Fi"
+      case "$wifi_security" in
+        ""|none|open)
+          uci set "wireless.$wifi_iface.encryption=psk2" \
+            || die "Не удалось включить защиту Wi-Fi"
+          ;;
+      esac
+      WIFI_PASSWORD="$wifi_new_password"
+      WIFI_CHANGED=1
+    fi
+  done <<EOF
+$wifi_ifaces
+EOF
+  if [ "$WIFI_CHANGED" = 1 ]; then
+    uci commit wireless || die "Не удалось сохранить настройки Wi-Fi"
+  fi
+  # Reload only after final_summary has printed the new connection details.
 }
 
 # ---- package install -------------------------------------------------------
@@ -3043,6 +3176,11 @@ final_summary() {
     printf '   Установка завершена с предупреждениями. Запусти %s ещё раз — установщик попробует починить.\n' "$0"
   fi
   printf '\n'
+  if [ "$mode" = first_install ] && [ "$WIFI_CHANGED" = 1 ]; then
+    [ -z "$WIFI_SSID_2G" ] || printf '   Wi-Fi 2.4 GHz: %s\n' "$WIFI_SSID_2G"
+    [ -z "$WIFI_SSID_5G" ] || printf '   Wi-Fi 5 GHz:   %s\n' "$WIFI_SSID_5G"
+    [ -z "$WIFI_PASSWORD" ] || printf '   Пароль Wi-Fi:  %s\n' "$WIFI_PASSWORD"
+  fi
 }
 
 # ---- main ------------------------------------------------------------------
@@ -3052,6 +3190,7 @@ printf '   Версия: %s   Режим: %s\n\n' "$VERSION" "$mode"
 
 preflight
 prompt_token
+prompt_wifi
 acquire_engine_lock
 if [ -d "$ACTIVE_INSTALL_DIR" ]; then
   prepare_candidate_runtime
@@ -3088,5 +3227,9 @@ activate_traffic_path
 install_cron
 restore_dhcp_lease
 start_update_guard
+apply_wifi_setup
 final_summary
 INSTALL_SUCCESS=1
+if [ "$mode" = first_install ] && [ "$WIFI_CHANGED" = 1 ]; then
+  wifi reload || warn "Не удалось перезагрузить Wi-Fi — выполни wifi reload вручную"
+fi
