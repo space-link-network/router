@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.70"
+VERSION="0.3.71"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -661,13 +661,18 @@ install_packages() {
     fi
   done
 
+  NAS_PACKAGES_ATTEMPTED=0
   for pkg in $OPTIONAL_PKGS; do
     if pkg_is_installed "$pkg"; then
       ok "$pkg (опц., уже стоит)"
-    elif pkg_install_one "$pkg"; then
-      ok "$pkg (опц.)"
     else
-      warn "не удалось установить $pkg (опционально, пропускаю)"
+      # kmod-tun is a VPN dependency, not one of the 14 NAS/USB packages.
+      [ "$pkg" = kmod-tun ] || NAS_PACKAGES_ATTEMPTED=1
+      if pkg_install_one "$pkg"; then
+        ok "$pkg (опц.)"
+      else
+        warn "не удалось установить $pkg (опционально, пропускаю)"
+      fi
     fi
   done
 }
@@ -3085,6 +3090,26 @@ final_summary() {
 
   # ---- диагностика ----------------------------------------------------------
   printf '\n--- Диагностика ---\n'
+
+  if [ "${NAS_PACKAGES_ATTEMPTED:-0}" = 1 ]; then
+    nas_total=0
+    nas_installed=0
+    nas_missing=""
+    for pkg in $OPTIONAL_PKGS; do
+      [ "$pkg" != kmod-tun ] || continue
+      nas_total=$((nas_total + 1))
+      if pkg_is_installed "$pkg"; then
+        nas_installed=$((nas_installed + 1))
+      else
+        nas_missing="${nas_missing:+$nas_missing, }$pkg"
+      fi
+    done
+    printf '   NAS/USB-пакеты:  %s из %s установлено' "$nas_installed" "$nas_total"
+    if [ -n "$nas_missing" ]; then
+      printf ' (не удалось: %s)' "$nas_missing"
+    fi
+    printf '\n'
+  fi
 
   dns_ok=0
   if pidof dnsmasq >/dev/null 2>&1; then
