@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.71"
+VERSION="0.3.72"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -591,6 +591,65 @@ EOF
     uci commit wireless || die "Не удалось сохранить настройки Wi-Fi"
   fi
   # Reload only after final_summary has printed the new connection details.
+}
+
+# ---- first-install auto-select setup ----------------------------------------
+prompt_auto_select() {
+  [ "$mode" = "first_install" ] || return 0
+
+  if [ -t 0 ]; then
+    _tty_in="/dev/stdin"
+  elif [ -r /dev/tty ]; then
+    _tty_in="/dev/tty"
+  else
+    printf '\nНет терминала для настройки автовыбора. Открой http://my.space/ и настрой автовыбор в панели управления.\n'
+    return 0
+  fi
+
+  printf '\nВключить автовыбор сервера по низкому пингу? [0] Не включать  [1] Включить: '
+  read -r auto_select_choice < "$_tty_in" || auto_select_choice=0
+  case "$auto_select_choice" in
+    1) ;;
+    *)
+      # Match state.Store.WriteAutoSelect(false): absence means disabled.
+      rm -f "$STATE_DIR/auto-select" || die "Не удалось отключить автовыбор"
+      return 0
+      ;;
+  esac
+
+  # Keep the default and bounds in sync with api/internal/state/state.go.
+  printf 'Интервал проверки в часах (2–72, Enter — 12): '
+  read -r auto_select_interval < "$_tty_in" || auto_select_interval=""
+  case "$auto_select_interval" in
+    ""|*[!0-9]*) auto_select_interval=12 ;;
+    *)
+      # Normalize decimal input without shell integer overflow or octal parsing.
+      while [ "${auto_select_interval#0}" != "$auto_select_interval" ]; do
+        auto_select_interval=${auto_select_interval#0}
+      done
+      [ -n "$auto_select_interval" ] || auto_select_interval=12
+      if [ "${#auto_select_interval}" -gt 2 ]; then
+        auto_select_interval=72
+      elif [ "$auto_select_interval" -lt 2 ]; then
+        auto_select_interval=2
+      elif [ "$auto_select_interval" -gt 72 ]; then
+        auto_select_interval=72
+      fi
+      ;;
+  esac
+
+  # Save immediately, before package installation and API startup. Match
+  # state.Store: decimal hours plus newline, then the enabled marker (0644).
+  # Unlike WiFi reload, these writes cannot drop the installer's SSH connection.
+  (
+    umask 022
+    mkdir -p "$STATE_DIR" &&
+      printf '%s\n' "$auto_select_interval" > "$STATE_DIR/auto-select-interval-hours" &&
+      chmod 0644 "$STATE_DIR/auto-select-interval-hours" &&
+      printf 'enabled\n' > "$STATE_DIR/auto-select" &&
+      chmod 0644 "$STATE_DIR/auto-select"
+  ) || die "Не удалось сохранить настройки автовыбора"
+  ok "Автовыбор сервера включён, проверка каждые $auto_select_interval ч."
 }
 
 # ---- package install -------------------------------------------------------
@@ -3216,6 +3275,7 @@ printf '   Версия: %s   Режим: %s\n\n' "$VERSION" "$mode"
 preflight
 prompt_token
 prompt_wifi
+prompt_auto_select
 acquire_engine_lock
 if [ -d "$ACTIVE_INSTALL_DIR" ]; then
   prepare_candidate_runtime
