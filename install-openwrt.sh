@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.72"
+VERSION="0.3.73"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -1970,6 +1970,14 @@ CAP
 save_state() {
   mkdir -p "$STATE_DIR"
   chmod 0755 "$STATE_DIR"
+  # The API persists connection uptime atomically via connection-since.tmp ->
+  # connection-since. Materialize both files on overlay storage before procd
+  # starts the API and its two-second panel watchdog. Never truncate an existing
+  # timestamp during repair/update installs.
+  for connection_state in "$STATE_DIR/connection-since" "$STATE_DIR/connection-since.tmp"; do
+    (umask 077; touch "$connection_state")
+    chmod 0600 "$connection_state"
+  done
   if [ -n "$TOKEN" ]; then
     umask 077
     printf '%s\n' "$TOKEN" > "$STATE_DIR/token"
