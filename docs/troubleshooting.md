@@ -94,7 +94,7 @@ wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/uninstall.sh | sh 
 
 ## Куда писать, если ничего не помогает
 
-- Telegram: [@spacelink_support](https://t.me/spacelink_support)
+- Telegram: [@space_link_support](https://t.me/space_link_support)
 
 В обращении укажите модель роутера, версию OpenWrt (`cat /etc/openwrt_release`) и
 вывод:

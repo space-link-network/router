@@ -81,7 +81,7 @@ wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/uninstall.sh | sh 
 
 ## Поддержка
 
-- Telegram: [@spacelink_support](https://t.me/spacelink_support)
+- Telegram: [@space_link_support](https://t.me/space_link_support)
 - Email: support@space-link.app
 
 ## Лицензия
