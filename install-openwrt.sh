@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.73"
+VERSION="0.3.74"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -584,6 +584,19 @@ apply_wifi_setup() {
       WIFI_PASSWORD="$wifi_new_password"
       WIFI_CHANGED=1
     fi
+    # Setting the SSID/password does not by itself turn broadcast on: the AP
+    # iface and its radio device each carry their own independent `disabled`
+    # flag (some OpenWrt images ship the iface disabled by default). Clear
+    # both whenever the operator opted into configuring this network so it
+    # actually comes up.
+    wifi_device=$(uci -q get "wireless.$wifi_iface.device" 2>/dev/null || true)
+    uci set "wireless.$wifi_iface.disabled=0" \
+      || die "Не удалось включить сеть Wi-Fi"
+    if [ -n "$wifi_device" ]; then
+      uci set "wireless.$wifi_device.disabled=0" \
+        || die "Не удалось включить радиомодуль Wi-Fi"
+    fi
+    WIFI_CHANGED=1
   done <<EOF
 $wifi_ifaces
 EOF
