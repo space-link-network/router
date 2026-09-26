@@ -1,5 +1,18 @@
 # Решение проблем
 
+## Куда писать, если ничего не помогает
+
+- Telegram: [@space_link_support](https://t.me/space_link_support)
+- Email: support@space-link.app
+
+В обращении укажите модель роутера, версию OpenWrt (`cat /etc/openwrt_release`) и
+вывод:
+
+```sh
+logread | tail -50
+/etc/init.d/space-link status
+```
+
 ## Не открывается `http://my.space/`
 
 1. Откройте панель по IP — адрес печатается в конце установки (по умолчанию
@@ -91,15 +104,3 @@ wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/uninstall.sh | sh 
 
 Флаг `--purge` удалит токен и состояние. Без него токен сохраняется для
 переустановки.
-
-## Куда писать, если ничего не помогает
-
-- Telegram: [@space_link_support](https://t.me/space_link_support)
-
-В обращении укажите модель роутера, версию OpenWrt (`cat /etc/openwrt_release`) и
-вывод:
-
-```sh
-logread | tail -50
-/etc/init.d/space-link status
-```
