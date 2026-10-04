@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.87"
+VERSION="0.3.88"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -56,6 +56,12 @@ REQUIRED_PKGS="ca-certificates curl lighttpd lighttpd-mod-proxy lighttpd-mod-rew
 # VPN-движок — best-effort: если недоступен в фиде, WARN и продолжаем, чтобы
 # панель/домен всё равно поднялись; движок можно доустановить позже.
 ENGINE_PKGS="sing-box"
+# Самая старая версия движка, понимающая конфиг, который пишет API: типизованный
+# блок dns.servers появился в sing-box 1.12. OpenWrt 23.05 несёт 1.11 — там
+# движок отвергает конфиг целиком, и ни одна настройка маршрутизации не
+# применяется. Проверяем явно, иначе роутер выглядит рабочим и молча игнорирует
+# всё, что владелец сохраняет.
+MIN_ENGINE_VERSION="1.12"
 # Optional pkgs — install if available, warn-only on failure.
 OPTIONAL_PKGS="kmod-tun kmod-usb3 kmod-usb-storage kmod-usb-storage-uas usbutils block-mount luci-app-fstab kmod-fs-ext4 ntfs-3g kmod-fs-vfat kmod-fs-exfat samba4-server luci-app-samba4 minidlna luci-app-minidlna"
 
@@ -732,6 +738,7 @@ install_packages() {
       warn "движок $pkg не установился — панель и домен поднимутся, но VPN не заработает, пока не поставишь его вручную: apk add $pkg (или opkg install $pkg)"
     fi
   done
+  check_engine_version
 
   NAS_PACKAGES_ATTEMPTED=0
   for pkg in $OPTIONAL_PKGS; do
@@ -747,6 +754,29 @@ install_packages() {
       fi
     fi
   done
+}
+
+# Движок старее MIN_ENGINE_VERSION отвергает конфиг, который пишет API, и
+# роутер продолжает жить на прежних правилах: панель сохраняет, трафик не
+# меняется. Молчать об этом нельзя — чинится только обновлением прошивки.
+check_engine_version() {
+  command -v sing-box >/dev/null 2>&1 || return 0
+  version=$(sing-box version 2>/dev/null | sed -n 's/.*version \([0-9][^ ]*\).*/\1/p' | head -n 1)
+  [ -n "$version" ] || return 0
+  major=${version%%.*}
+  rest=${version#*.}
+  minor=${rest%%.*}
+  case "$major$minor" in
+    *[!0-9]*|'') return 0 ;;
+  esac
+  want_major=${MIN_ENGINE_VERSION%%.*}
+  want_minor=${MIN_ENGINE_VERSION#*.}
+  want_minor=${want_minor%%.*}
+  if [ "$major" -gt "$want_major" ] || { [ "$major" -eq "$want_major" ] && [ "$minor" -ge "$want_minor" ]; }; then
+    ok "движок sing-box $version"
+    return 0
+  fi
+  err "движок sing-box $version слишком старый — нужен $MIN_ENGINE_VERSION или новее. Он отвергает конфигурацию целиком, поэтому маршрутизация, пресеты и выбор сервера применяться НЕ будут. Обновите прошивку роутера до OpenWrt 24.10+ (там sing-box 1.12) или поставьте свежий sing-box вручную."
 }
 
 # ---- download artifacts ----------------------------------------------------
