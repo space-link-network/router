@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.88"
+VERSION="0.3.89"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -849,6 +849,7 @@ etc/config/space-link
 etc/lighttpd/conf.d/space-link.conf
 etc/init.d/space-link
 etc/init.d/space-link-dns
+etc/init.d/space-link-dns-pinning
 etc/init.d/space-link-tproxy
 etc/init.d/space-link-update-guard
 usr/bin/space-link-dns
@@ -860,6 +861,7 @@ etc/space-link/version
 etc/space-link/lan-ipv6.restore
 etc/space-link/tproxy.nft
 etc/space-link/tproxy.armed
+etc/space-link/dns-pinning.nft
 EOF
 }
 
@@ -2164,11 +2166,80 @@ table inet space_link_dns {
 NFT
 }
 
+# The redirect table lives outside /etc/nftables.d (same reason as the
+# standalone TPROXY table: fw4 would otherwise nest "table inside table").
+# That also means fw4 silently drops it on every reload — any
+# `/etc/init.d/network restart`, WAN reconnect, Wi-Fi save or UCI firewall
+# commit — exactly like it drops `space_link`. The TPROXY table survives
+# that because it owns its own init.d script plus a firewall hotplug hook
+# (see configure_tproxy); before this, the DNS table had neither and was
+# only ever resurrected by the watchdog's ~20s poll, if that poll happened
+# to land after the reload AND the resolver was already healthy again. In
+# that gap a LAN client with a hardcoded public resolver (8.8.8.8, DoH, …)
+# resolved `my.space` straight to the real, publicly parked domain instead
+# of the panel — reproducing exactly that gap is what
+# scripts/test-dns-pinning-hotplug.sh exercises. install_dns_pinning_service
+# gives the DNS table the identical boot-time + hotplug lifecycle the TPROXY
+# table already has; the watchdog poll remains as a slower second backstop.
+install_dns_pinning_service() {
+  cat > /etc/init.d/space-link-dns-pinning <<'INITD'
+#!/bin/sh /etc/rc.common
+START=99
+STOP=10
+
+resolver_ok() {
+  if command -v nslookup >/dev/null 2>&1; then
+    nslookup my.space 127.0.0.1 >/dev/null 2>&1 && return 0
+    return 1
+  fi
+  pidof dnsmasq >/dev/null 2>&1
+}
+
+apply() {
+  # Never force LAN DNS into a dead local resolver: that would turn a dead
+  # dnsmasq into a total internet-DNS outage for every client instead of just
+  # losing the panel name. Fail open exactly like the watchdog's poll does.
+  if ! resolver_ok; then
+    nft delete table inet space_link_dns 2>/dev/null
+    return 1
+  fi
+  if ! nft_output=$(nft -f /etc/space-link/dns-pinning.nft 2>&1); then
+    printf '%s\n' "$nft_output" | logger -t space-link-dns-pinning
+    nft delete table inet space_link_dns 2>/dev/null
+    return 1
+  fi
+  [ -z "$nft_output" ] || printf '%s\n' "$nft_output" | logger -t space-link-dns-pinning
+  return 0
+}
+
+start() { apply; }
+stop() { nft delete table inet space_link_dns 2>/dev/null; }
+reload() { apply; }
+INITD
+  chmod 0755 /etc/init.d/space-link-dns-pinning
+
+  mkdir -p /etc/hotplug.d/firewall 2>/dev/null || true
+  cat > /etc/hotplug.d/firewall/99-space-link-dns <<'HOOK'
+#!/bin/sh
+# fw4 reload drops the standalone space_link_dns table exactly like it drops
+# space_link. Re-arm it immediately instead of waiting for the watchdog's
+# next ~20s tick, so a hardcoded-resolver client never gets the public
+# my.space parking page just because Wi-Fi settings were saved or the WAN
+# reconnected.
+/etc/init.d/space-link-dns-pinning reload >/dev/null 2>&1 || true
+HOOK
+  chmod 0755 /etc/hotplug.d/firewall/99-space-link-dns
+
+  /etc/init.d/space-link-dns-pinning enable 2>/dev/null || true
+}
+
 apply_dns_pinning() {
   step "Локальные имена роутера для всей сети"
   command -v nft >/dev/null 2>&1 || { warn "nft отсутствует — пропускаю"; return 0; }
   write_dns_pinning_ruleset
-  if nft -f /etc/space-link/dns-pinning.nft >/dev/null 2>&1; then
+  install_dns_pinning_service
+  if /etc/init.d/space-link-dns-pinning start >/dev/null 2>&1 \
+     && nft list table inet space_link_dns >/dev/null 2>&1; then
     ok "запросы имён из сети обслуживает сам роутер"
   else
     warn "не удалось включить перехват DNS — имена будут работать только у устройств с DNS роутера"

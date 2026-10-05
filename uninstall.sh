@@ -84,6 +84,12 @@ if command -v nft >/dev/null 2>&1; then
   nft delete table inet space_link >/dev/null 2>&1 || true
   nft delete table inet space_link_dns >/dev/null 2>&1 || true
 fi
+if [ -x /etc/init.d/space-link-dns-pinning ]; then
+  /etc/init.d/space-link-dns-pinning stop 2>/dev/null || true
+  /etc/init.d/space-link-dns-pinning disable 2>/dev/null || true
+fi
+rm -f /etc/init.d/space-link-dns-pinning 2>/dev/null || true
+rm -f /etc/hotplug.d/firewall/99-space-link-dns 2>/dev/null || true
 rm -f /etc/space-link/dns-pinning.nft 2>/dev/null || true
 # Panel names pinned in /etc/hosts must go with the rest.
 if [ -f /etc/hosts ] && grep -q '# space-link-panel$' /etc/hosts 2>/dev/null; then
