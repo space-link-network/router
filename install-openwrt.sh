@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.94"
+VERSION="0.3.95"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
@@ -1815,7 +1815,7 @@ HOOK
 traffic_engine_ready() {
   [ -s /etc/space-link/active-server ] || return 1
   if [ -x /usr/bin/sing-box ]; then
-    /usr/bin/sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1 || return 1
+    GOMEMLIMIT=48MiB GOGC=30 /usr/bin/sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1 || return 1
   fi
   pidof sing-box >/dev/null 2>&1 || return 1
   command -v netstat >/dev/null 2>&1 || return 1
