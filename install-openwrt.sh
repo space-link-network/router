@@ -3,10 +3,10 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.95"
+VERSION="0.3.96"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
-RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/permalink/latest/downloads}"
+RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/v${VERSION}/downloads}"
 CLOUD_API="${CLOUD_API:-https://api.space-link.app/api/v1}"
 STATE_DIR="/etc/space-link"
 BACKUP_DIR="/etc/space-link/backups"

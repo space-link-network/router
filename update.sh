@@ -7,7 +7,7 @@ export FORCE_UPDATE
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0" 2>/dev/null || echo .)" && pwd 2>/dev/null || echo /tmp)
 
-if [ -f "$SCRIPT_DIR/install.sh" ]; then
+if [ -z "${INSTALL_URL:-}" ] && [ -f "$SCRIPT_DIR/install.sh" ]; then
   exec sh "$SCRIPT_DIR/install.sh" "$@"
 fi
 
