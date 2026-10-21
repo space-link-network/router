@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.97"
+VERSION="0.3.98"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/v${VERSION}/downloads}"
@@ -214,6 +214,19 @@ cleanup_install_artifacts() {
     else
       rm -rf "$dir" 2>/dev/null || true
     fi
+  done
+}
+
+# The engine lock guarantees that no other installer owns a staging directory.
+# A killed download may leave one on persistent flash; remove only our exact
+# PID-named directories, never the active or rollback runtime.
+cleanup_abandoned_candidates() {
+  candidate_parent=${ACTIVE_INSTALL_DIR%/*}
+  for dir in "$candidate_parent"/.space-link-candidate.[0-9]*; do
+    [ -d "$dir" ] && [ ! -L "$dir" ] || continue
+    suffix=${dir##*/.space-link-candidate.}
+    case "$suffix" in ''|*[!0-9]*) continue ;; esac
+    rm -rf "$dir" 2>/dev/null || warn "Не удалось удалить остаток прерванного обновления: $dir"
   done
 }
 
@@ -3456,6 +3469,7 @@ prompt_token
 prompt_wifi
 prompt_auto_select
 acquire_engine_lock
+cleanup_abandoned_candidates
 if [ -d "$ACTIVE_INSTALL_DIR" ]; then
   prepare_candidate_runtime
   snapshot_update_state
