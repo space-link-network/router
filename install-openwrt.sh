@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 set -eu
 
-VERSION="0.3.96"
+VERSION="0.3.97"
 # GitLab "permalink/latest" resolves to the most recent release of the public
 # project and exposes each release asset at /downloads/<asset-name>.
 RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/v${VERSION}/downloads}"
@@ -62,8 +62,9 @@ ENGINE_PKGS="sing-box"
 # применяется. Проверяем явно, иначе роутер выглядит рабочим и молча игнорирует
 # всё, что владелец сохраняет.
 MIN_ENGINE_VERSION="1.12"
-# Optional pkgs — install if available, warn-only on failure.
-OPTIONAL_PKGS="kmod-tun kmod-usb3 kmod-usb-storage kmod-usb-storage-uas usbutils block-mount luci-app-fstab kmod-fs-ext4 ntfs-3g kmod-fs-vfat kmod-fs-exfat samba4-server luci-app-samba4 minidlna luci-app-minidlna"
+# NAS/USB packages are opt-in: Samba and its dependencies alone occupy tens
+# of megabytes of flash. Existing packages are never removed by an update.
+OPTIONAL_PKGS="kmod-usb3 kmod-usb-storage kmod-usb-storage-uas usbutils block-mount luci-app-fstab kmod-fs-ext4 ntfs-3g kmod-fs-vfat kmod-fs-exfat samba4-server luci-app-samba4 minidlna luci-app-minidlna"
 
 # Resolve script dir so the bundled installer (run from a worktree or
 # /tmp extraction) can find ./lib and ./templates. When piped via wget,
@@ -740,20 +741,30 @@ install_packages() {
   done
   check_engine_version
 
+  # TUN supports protected traffic; unlike the NAS stack it is inexpensive.
+  if pkg_is_installed kmod-tun; then
+    ok "kmod-tun (уже стоит)"
+  elif pkg_install_one kmod-tun; then
+    ok "kmod-tun"
+  else
+    warn "не удалось установить kmod-tun (опционально)"
+  fi
+
   NAS_PACKAGES_ATTEMPTED=0
-  for pkg in $OPTIONAL_PKGS; do
-    if pkg_is_installed "$pkg"; then
-      ok "$pkg (опц., уже стоит)"
-    else
-      # kmod-tun is a VPN dependency, not one of the 14 NAS/USB packages.
-      [ "$pkg" = kmod-tun ] || NAS_PACKAGES_ATTEMPTED=1
-      if pkg_install_one "$pkg"; then
-        ok "$pkg (опц.)"
+  if [ "${SPACE_LINK_INSTALL_NAS:-0}" = 1 ]; then
+    NAS_PACKAGES_ATTEMPTED=1
+    for pkg in $OPTIONAL_PKGS; do
+      if pkg_is_installed "$pkg"; then
+        ok "$pkg (NAS/USB, уже стоит)"
+      elif pkg_install_one "$pkg"; then
+        ok "$pkg (NAS/USB)"
       else
-        warn "не удалось установить $pkg (опционально, пропускаю)"
+        warn "не удалось установить $pkg (NAS/USB, пропускаю)"
       fi
-    fi
-  done
+    done
+  else
+    ok "NAS/USB-пакеты не устанавливаются автоматически (SPACE_LINK_INSTALL_NAS=1 для установки)"
+  fi
 }
 
 # Движок старее MIN_ENGINE_VERSION отвергает конфиг, который пишет API, и
@@ -827,12 +838,48 @@ update_root_path() {
 prepare_candidate_runtime() {
   UPDATE_MODE=1
   rm -rf "$CANDIDATE_DIR" 2>/dev/null || true
-  mkdir -p "$(dirname "$CANDIDATE_DIR")"
+  mkdir -p "$CANDIDATE_DIR"
   if [ -d "$ACTIVE_INSTALL_DIR" ]; then
-    cp -a "$ACTIVE_INSTALL_DIR" "$CANDIDATE_DIR" \
-      || die "Не удалось подготовить изолированную копию текущей версии"
-  else
-    mkdir -p "$CANDIDATE_DIR"
+    # The new binary is downloaded below; old binaries (including legacy .bak
+    # files) need no duplicate. Large blocklists are immutable snapshots: the
+    # manager replaces files by atomic rename, so hard links preserve both the
+    # candidate and rollback copy without consuming another ~20 MB of flash.
+    for item in "$ACTIVE_INSTALL_DIR"/* "$ACTIVE_INSTALL_DIR"/.[!.]* "$ACTIVE_INSTALL_DIR"/..?*; do
+      [ -e "$item" ] || [ -L "$item" ] || continue
+      name=${item##*/}
+      case "$name" in
+        space-link-api|space-link-api.bak.*|.www.new.*|.www.old.*) continue ;;
+        rules)
+          mkdir -p "$CANDIDATE_DIR/rules"
+          for rule_item in "$item"/* "$item"/.[!.]* "$item"/..?*; do
+            [ -e "$rule_item" ] || [ -L "$rule_item" ] || continue
+            rule_name=${rule_item##*/}
+            if [ "$rule_name" = blocklists ] && [ -d "$rule_item" ]; then
+              mkdir -p "$CANDIDATE_DIR/rules/blocklists"
+              for list_file in "$rule_item"/* "$rule_item"/.[!.]* "$rule_item"/..?*; do
+                [ -e "$list_file" ] || [ -L "$list_file" ] || continue
+                list_name=${list_file##*/}
+                case "$list_name" in
+                  *.tmp|*.source.tmp|*.input.json|.blocklist-*) continue ;;
+                esac
+                if [ -f "$list_file" ] && [ ! -L "$list_file" ]; then
+                  ln "$list_file" "$CANDIDATE_DIR/rules/blocklists/$list_name" \
+                    || die "Не удалось подготовить списки блокировок для обновления"
+                else
+                  cp -a "$list_file" "$CANDIDATE_DIR/rules/blocklists/" \
+                    || die "Не удалось подготовить списки блокировок для обновления"
+                fi
+              done
+            else
+              cp -a "$rule_item" "$CANDIDATE_DIR/rules/" \
+                || die "Не удалось подготовить правила маршрутизации для обновления"
+            fi
+          done
+          ;;
+        *) cp -a "$item" "$CANDIDATE_DIR/" \
+          || die "Не удалось подготовить изолированную копию текущей версии" ;;
+      esac
+    done
   fi
   set_install_target "$CANDIDATE_DIR"
 }
@@ -1013,10 +1060,16 @@ restore_update_snapshot() {
     esac
     target=$(update_root_path "$relative")
     snapshot="$UPDATE_DIR/snapshot/$relative"
-    rm -rf "$target" 2>/dev/null || true
     if [ -e "$snapshot" ] || [ -L "$snapshot" ]; then
       mkdir -p "$(dirname "$target")"
-      cp -a "$snapshot" "$target" || return 1
+      staged="$target.restore.$$"
+      rm -f "$staged" 2>/dev/null || true
+      cp -a "$snapshot" "$staged" || return 1
+      # dnsmasq/UCI can rewrite dhcp while rollback runs. Rename replaces a
+      # concurrently recreated file atomically; cp directly to target does not.
+      mv -f "$staged" "$target" || { rm -f "$staged"; return 1; }
+    else
+      rm -f "$target" 2>/dev/null || return 1
     fi
   done < "$UPDATE_DIR/managed-files"
 }
@@ -1130,7 +1183,7 @@ install_binary() {
   step "Загрузка space-link-api ($ARCH)"
   mkdir -p "$INSTALL_DIR"
   url="$RELEASE_BASE/space-link-api-$ARCH"
-  fetch "$url" "$BIN_PATH.new" || die "Не удалось скачать $url"
+  fetch "$url" "$BIN_PATH.new" || die "Не удалось загрузить или записать $url. Проверьте свободное место на роутере."
   chmod 0755 "$BIN_PATH.new"
   mv "$BIN_PATH.new" "$BIN_PATH"
   ok "$BIN_PATH"
@@ -3282,7 +3335,6 @@ final_summary() {
     nas_installed=0
     nas_missing=""
     for pkg in $OPTIONAL_PKGS; do
-      [ "$pkg" != kmod-tun ] || continue
       nas_total=$((nas_total + 1))
       if pkg_is_installed "$pkg"; then
         nas_installed=$((nas_installed + 1))
