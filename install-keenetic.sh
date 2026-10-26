@@ -18,7 +18,7 @@
 #   wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install-keenetic.sh | sh
 set -eu
 
-VERSION="0.3.101"
+VERSION="0.3.102"
 
 # ---- Entware paths ---------------------------------------------------------
 OPT="/opt"
