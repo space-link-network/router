@@ -18,24 +18,23 @@ ssh root@192.168.1.1
 
 Введите пароль администратора OpenWrt. На Windows можно использовать встроенный терминал Windows 10/11 или [PuTTY](https://www.chiark.greenend.org.uk/~sgtatham/putty/latest.html). Если SSH выключен или вход не проходит, проверьте его в настройках OpenWrt, прежде чем продолжать.
 
-## 2. Скачайте и запустите установщик OpenWrt
+## 2. Запустите установщик Space Link
 
-В окне SSH выполните **обе строки по очереди**:
+В окне SSH выполните команду. Общий установщик сам определит прошивку роутера и выберет нужный способ установки:
 
 ```sh
-curl -fsSL https://gitlab.com/space-link-vpn/router/-/raw/main/install-openwrt.sh -o /tmp/space-link-install.sh
-sh /tmp/space-link-install.sh
+wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 ```
 
-Если на роутере нет `curl`, вместо первой строки используйте:
+Если `wget` не может загрузить файл по HTTPS, используйте `curl`:
 
 ```sh
-wget -O /tmp/space-link-install.sh https://gitlab.com/space-link-vpn/router/-/raw/main/install-openwrt.sh
+curl -fsSL https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 ```
 
 Дождитесь окончания установки и не отключайте питание роутера. Установщик может попросить ключ, предложить настроить Wi-Fi и показать результат проверки. Если ключ не вводили, добавьте его позже в панели.
 
-> Загружайте установщик только из [официального репозитория](https://gitlab.com/space-link-vpn/router). Перед запуском можно просмотреть файл командой `less /tmp/space-link-install.sh`.
+> Загружайте установщик только из [официального репозитория](https://gitlab.com/space-link-vpn/router). Если хотите сначала прочитать скрипт, скачайте `install.sh` в файл и просмотрите его перед запуском.
 
 ## 3. Откройте панель и проверьте подключение
 
