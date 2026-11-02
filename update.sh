@@ -12,7 +12,7 @@ if [ -z "${INSTALL_URL:-}" ] && [ -f "$SCRIPT_DIR/install.sh" ]; then
 fi
 
 # Piped over network — re-download install.sh
-URL="${INSTALL_URL:-https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh}"
+URL="${INSTALL_URL:-https://raw.githubusercontent.com/space-link-network/router/main/install.sh}"
 if command -v curl >/dev/null 2>&1; then
   curl -fsSL "$URL" | sh
 else
