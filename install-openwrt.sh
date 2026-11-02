@@ -1,12 +1,11 @@
 #!/bin/sh
 # Space Link Router installer. POSIX sh, runs in BusyBox.
-# Usage: wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
+# Usage: wget -qO- https://raw.githubusercontent.com/space-link-network/router/main/install.sh | sh
 set -eu
 
 VERSION="0.3.102"
-# GitLab "permalink/latest" resolves to the most recent release of the public
-# project and exposes each release asset at /downloads/<asset-name>.
-RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/releases/v${VERSION}/downloads}"
+# Each stable release publishes assets under its versioned GitHub Release URL.
+RELEASE_BASE="${RELEASE_BASE:-https://github.com/space-link-network/router/releases/download/v${VERSION}}"
 CLOUD_API="${CLOUD_API:-https://api.space-link.app/api/v1}"
 STATE_DIR="/etc/space-link"
 BACKUP_DIR="/etc/space-link/backups"

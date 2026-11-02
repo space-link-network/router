@@ -23,18 +23,18 @@ ssh root@192.168.1.1
 В окне SSH выполните команду. Общий установщик сам определит прошивку роутера и выберет нужный способ установки:
 
 ```sh
-wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
+wget -qO- https://raw.githubusercontent.com/space-link-network/router/main/install.sh | sh
 ```
 
 Если `wget` не может загрузить файл по HTTPS, используйте `curl`:
 
 ```sh
-curl -fsSL https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/space-link-network/router/main/install.sh | sh
 ```
 
 Дождитесь окончания установки и не отключайте питание роутера. Установщик может попросить ключ, предложить настроить Wi-Fi и показать результат проверки. Если ключ не вводили, добавьте его позже в панели.
 
-> Загружайте установщик только из [официального репозитория](https://gitlab.com/space-link-vpn/router). Если хотите сначала прочитать скрипт, скачайте `install.sh` в файл и просмотрите его перед запуском.
+> Загружайте установщик только из [официального репозитория](https://github.com/space-link-network/router). Если хотите сначала прочитать скрипт, скачайте `install.sh` в файл и просмотрите его перед запуском.
 
 ## 3. Откройте панель и проверьте подключение
 
@@ -44,6 +44,6 @@ curl -fsSL https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
 
 ## Обновление и удаление
 
-Обновления можно проверить в самой панели. Для ручного обновления и удаления есть отдельные [update.sh](https://gitlab.com/space-link-vpn/router/-/raw/main/update.sh) и [uninstall.sh](https://gitlab.com/space-link-vpn/router/-/raw/main/uninstall.sh); не используйте повторную прошивку OpenWrt как обычный способ удаления.
+Обновления можно проверить в самой панели. Для ручного обновления и удаления есть отдельные [update.sh](https://raw.githubusercontent.com/space-link-network/router/main/update.sh) и [uninstall.sh](https://raw.githubusercontent.com/space-link-network/router/main/uninstall.sh); не используйте повторную прошивку OpenWrt как обычный способ удаления.
 
 Если панель не открывается или интернет не работает, перейдите к [решению частых проблем](../troubleshooting.md). Поддержка: [Telegram](https://t.me/space_link_support) или support@space-link.app.

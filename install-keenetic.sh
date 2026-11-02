@@ -15,7 +15,7 @@
 #                    держит :80/:443 под своим веб-интерфейсом).
 #
 # Запуск (через dispatcher install.sh он подхватывается автоматически):
-#   wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install-keenetic.sh | sh
+#   wget -qO- https://raw.githubusercontent.com/space-link-network/router/main/install-keenetic.sh | sh
 set -eu
 
 VERSION="0.3.102"
@@ -29,7 +29,7 @@ STATE_DIR="$OPT_ETC/space-link"
 INSTALL_DIR="$OPT/space-link"
 PANEL_PORT="${PANEL_PORT:-88}"   # KeeneticOS держит :80 под своим UI.
 
-RELEASE_BASE="${RELEASE_BASE:-https://gitlab.com/space-link-vpn/router/-/raw/main/dist}"
+RELEASE_BASE="${RELEASE_BASE:-https://github.com/space-link-network/router/releases/download/v${VERSION}}"
 
 # ---- pretty print ----------------------------------------------------------
 step() { printf '\n==> %s\n' "$1"; }

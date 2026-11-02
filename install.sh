@@ -5,12 +5,12 @@
 # and runs the matching installer. Universal entry point — same URL works
 # everywhere:
 #
-#   wget -qO- https://gitlab.com/space-link-vpn/router/-/raw/main/install.sh | sh
+#   wget -qO- https://raw.githubusercontent.com/space-link-network/router/main/install.sh | sh
 #
 # Power users can skip the dispatcher and call install-<firmware>.sh directly.
 set -eu
 
-INSTALLER_BASE="${INSTALLER_BASE:-https://gitlab.com/space-link-vpn/router/-/raw/main}"
+INSTALLER_BASE="${INSTALLER_BASE:-https://raw.githubusercontent.com/space-link-network/router/main}"
 
 # ---- detection -------------------------------------------------------------
 detect_firmware() {
