@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://raw.githubusercontent.com/space-link-network/router/main/install.sh | sh
 set -eu
 
-VERSION="0.3.115"
+VERSION="0.3.119"
 # Each stable release publishes assets under its versioned GitHub Release URL.
 RELEASE_BASE="${RELEASE_BASE:-https://github.com/space-link-network/router/releases/download/v${VERSION}}"
 CLOUD_API="${CLOUD_API:-https://api.space-link.app/api/v1}"

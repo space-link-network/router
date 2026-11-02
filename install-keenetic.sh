@@ -18,7 +18,7 @@
 #   wget -qO- https://raw.githubusercontent.com/space-link-network/router/main/install-keenetic.sh | sh
 set -eu
 
-VERSION="0.3.115"
+VERSION="0.3.119"
 
 # ---- Entware paths ---------------------------------------------------------
 OPT="/opt"
