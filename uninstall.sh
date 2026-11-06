@@ -25,6 +25,12 @@ if [ -x /usr/bin/space-link-panel-watchdog ]; then
 fi
 
 printf '==> Останавливаю сервисы\n'
+# Uninstall is an explicit request to restore plain WAN. Remove the outage
+# guard before deleting its script or persistent marker.
+if [ -x /usr/bin/space-link-traffic-guard ]; then
+  /usr/bin/space-link-traffic-guard off 2>/dev/null || true
+fi
+/etc/init.d/space-link-traffic-guard disable 2>/dev/null || true
 /etc/init.d/space-link-update-guard stop 2>/dev/null || true
 /etc/init.d/space-link-update-guard disable 2>/dev/null || true
 /etc/init.d/space-link stop 2>/dev/null || true
@@ -44,6 +50,8 @@ rm -rf /etc/xray 2>/dev/null || true
 rm -f /usr/bin/geoip.dat /usr/bin/geosite.dat 2>/dev/null || true
 rm -f /usr/bin/space-link-dns 2>/dev/null || true
 rm -f /usr/bin/space-link-panel-watchdog 2>/dev/null || true
+rm -f /usr/bin/space-link-traffic-guard /etc/init.d/space-link-traffic-guard 2>/dev/null || true
+rm -f /etc/space-link/traffic-guard.nft /etc/space-link/traffic-guard.enabled /etc/space-link/traffic-guard.hold 2>/dev/null || true
 rm -f /usr/bin/space-link-update-guard 2>/dev/null || true
 rm -f /etc/init.d/space-link-update-guard 2>/dev/null || true
 rm -f /etc/hotplug.d/iface/99-space-link-panel-ip 2>/dev/null || true
@@ -82,6 +90,7 @@ if command -v uci >/dev/null 2>&1; then
 fi
 if command -v nft >/dev/null 2>&1; then
   nft delete table inet space_link >/dev/null 2>&1 || true
+  nft delete table inet space_link_guard >/dev/null 2>&1 || true
   nft delete table inet space_link_dns >/dev/null 2>&1 || true
 fi
 if [ -x /etc/init.d/space-link-dns-pinning ]; then

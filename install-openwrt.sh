@@ -3,7 +3,7 @@
 # Usage: wget -qO- https://raw.githubusercontent.com/space-link-network/router/main/install.sh | sh
 set -eu
 
-VERSION="0.3.123"
+VERSION="0.3.132"
 # Each stable release publishes assets under its versioned GitHub Release URL.
 RELEASE_BASE="${RELEASE_BASE:-https://github.com/space-link-network/router/releases/download/v${VERSION}}"
 CLOUD_API="${CLOUD_API:-https://api.space-link.app/api/v1}"
@@ -51,7 +51,7 @@ ROUTER_IP=""
 # Пакеты, критичные для ПАНЕЛИ/ДОМЕНА — установка прерывается, если чего-то нет.
 # sing-box (VPN-движок) СОЗНАТЕЛЬНО не здесь: его отсутствие не должно мешать
 # подняться панели и my.space (см. цикл движка в install_packages).
-REQUIRED_PKGS="ca-certificates curl lighttpd lighttpd-mod-proxy lighttpd-mod-rewrite lighttpd-mod-redirect lighttpd-mod-setenv"
+REQUIRED_PKGS="ca-certificates curl lighttpd lighttpd-mod-proxy lighttpd-mod-rewrite lighttpd-mod-setenv"
 # VPN-движок — best-effort: если недоступен в фиде, WARN и продолжаем, чтобы
 # панель/домен всё равно поднялись; движок можно доустановить позже.
 ENGINE_PKGS="sing-box"
@@ -61,9 +61,10 @@ ENGINE_PKGS="sing-box"
 # применяется. Проверяем явно, иначе роутер выглядит рабочим и молча игнорирует
 # всё, что владелец сохраняет.
 MIN_ENGINE_VERSION="1.12"
-# NAS/USB packages are opt-in: Samba and its dependencies alone occupy tens
-# of megabytes of flash. Existing packages are never removed by an update.
-OPTIONAL_PKGS="kmod-usb3 kmod-usb-storage kmod-usb-storage-uas usbutils block-mount luci-app-fstab kmod-fs-ext4 ntfs-3g kmod-fs-vfat kmod-fs-exfat samba4-server luci-app-samba4 minidlna luci-app-minidlna"
+# USB/DLNA packages are opt-in. Space Link never installs Samba: its large
+# libraries and background daemons are unnecessary for protected traffic.
+# Existing user-installed packages are never removed by an update.
+OPTIONAL_PKGS="kmod-usb3 kmod-usb-storage kmod-usb-storage-uas usbutils block-mount luci-app-fstab kmod-fs-ext4 ntfs-3g kmod-fs-vfat kmod-fs-exfat minidlna luci-app-minidlna"
 
 # Resolve script dir so the bundled installer (run from a worktree or
 # /tmp extraction) can find ./lib and ./templates. When piped via wget,
@@ -753,29 +754,24 @@ install_packages() {
   done
   check_engine_version
 
-  # TUN supports protected traffic; unlike the NAS stack it is inexpensive.
-  if pkg_is_installed kmod-tun; then
-    ok "kmod-tun (уже стоит)"
-  elif pkg_install_one kmod-tun; then
-    ok "kmod-tun"
-  else
-    warn "не удалось установить kmod-tun (опционально)"
-  fi
+  # Space Link uses nftables TPROXY, not a TUN interface. Do not pull the
+  # unused kernel module into new installations. A module already installed
+  # for another application is left untouched.
 
   NAS_PACKAGES_ATTEMPTED=0
   if [ "${SPACE_LINK_INSTALL_NAS:-0}" = 1 ]; then
     NAS_PACKAGES_ATTEMPTED=1
     for pkg in $OPTIONAL_PKGS; do
       if pkg_is_installed "$pkg"; then
-        ok "$pkg (NAS/USB, уже стоит)"
+        ok "$pkg (USB/DLNA, уже стоит)"
       elif pkg_install_one "$pkg"; then
-        ok "$pkg (NAS/USB)"
+        ok "$pkg (USB/DLNA)"
       else
-        warn "не удалось установить $pkg (NAS/USB, пропускаю)"
+        warn "не удалось установить $pkg (USB/DLNA, пропускаю)"
       fi
     done
   else
-    ok "NAS/USB-пакеты не устанавливаются автоматически (SPACE_LINK_INSTALL_NAS=1 для установки)"
+    ok "USB/DLNA-пакеты не устанавливаются автоматически (SPACE_LINK_INSTALL_NAS=1 для установки)"
   fi
 }
 
@@ -910,9 +906,11 @@ etc/init.d/space-link
 etc/init.d/space-link-dns
 etc/init.d/space-link-dns-pinning
 etc/init.d/space-link-tproxy
+etc/init.d/space-link-traffic-guard
 etc/init.d/space-link-update-guard
 usr/bin/space-link-dns
 usr/bin/space-link-panel-watchdog
+usr/bin/space-link-traffic-guard
 usr/bin/space-link-update-guard
 etc/hotplug.d/iface/99-space-link-panel-ip
 etc/crontabs/root
@@ -920,6 +918,9 @@ etc/space-link/version
 etc/space-link/lan-ipv6.restore
 etc/space-link/tproxy.nft
 etc/space-link/tproxy.armed
+etc/space-link/traffic-guard.nft
+etc/space-link/traffic-guard.enabled
+etc/space-link/traffic-guard.hold
 etc/space-link/dns-pinning.nft
 EOF
 }
@@ -1186,6 +1187,14 @@ rollback_installer_transaction() {
     rm -f "$UPDATE_DIR/pending" 2>/dev/null || true
     rm -rf "$CANDIDATE_DIR" 2>/dev/null || true
     restore_pre_activation_services
+  fi
+  if [ -z "$UPDATE_ROOT" ]; then
+    restored_guard=$(update_root_path usr/bin/space-link-traffic-guard)
+    if [ -x "$restored_guard" ]; then
+      "$restored_guard" sync >/dev/null 2>&1 || warn "Не удалось восстановить защиту трафика после отката"
+    else
+      nft delete table inet space_link_guard >/dev/null 2>&1 || true
+    fi
   fi
   UPDATE_TX_ACTIVE=0
   UPDATE_TX_PREPARED=0
@@ -1601,6 +1610,12 @@ fallback_to_router_ip() {
 }
 
 disarm_traffic_path() {
+  if [ -s /etc/space-link/active-server ] \
+     && [ -x /usr/bin/space-link-traffic-guard ] \
+     && ! grep -Eq '"reason"[[:space:]]*:[[:space:]]*"user"' /etc/space-link/watchdog.json 2>/dev/null; then
+    /usr/bin/space-link-traffic-guard arm \
+      || die "Не удалось закрыть прямой выход до обновления VPN"
+  fi
   # Remove the old unconditional hotplug first. Otherwise a firewall reload
   # during package installation can recreate the table after we stop it.
   rm -f /etc/hotplug.d/firewall/99-space-link-tproxy 2>/dev/null || true
@@ -1863,6 +1878,7 @@ if [ -f /etc/space-link/tproxy.armed ] && pidof sing-box >/dev/null 2>&1; then
 else
   /etc/init.d/space-link-tproxy stop >/dev/null 2>&1
 fi
+[ -x /usr/bin/space-link-traffic-guard ] && /usr/bin/space-link-traffic-guard sync >/dev/null 2>&1 || true
 HOOK
   chmod 0755 /etc/hotplug.d/firewall/99-space-link-tproxy
 
@@ -1873,6 +1889,100 @@ HOOK
   # activate_traffic_path performs the engine/config/listener health gate.
   /etc/init.d/space-link-tproxy enable 2>/dev/null || true
   ok "TPROXY настроен и ожидает проверку sing-box"
+}
+
+# A separate forward/input hook protects the LAN while sing-box and TPROXY
+# restart. The router's own OUTPUT and its LAN panel remain reachable. This
+# table is independent of space_link, which restart deliberately removes.
+configure_traffic_guard() {
+  mkdir -p /etc/space-link || die "Не удалось создать каталог защиты трафика"
+  cat > /etc/space-link/traffic-guard.nft <<'NFT'
+table inet space_link_guard
+delete table inet space_link_guard
+
+table inet space_link_guard {
+    chain lan_forward {
+        type filter hook forward priority -1; policy accept;
+        iifname "br-lan" oifname != "br-lan" drop
+    }
+    chain lan_dns {
+        type filter hook input priority -1; policy accept;
+        iifname "br-lan" meta l4proto { tcp, udp } th dport 53 drop
+    }
+}
+NFT
+  cat > /usr/bin/space-link-traffic-guard <<'GUARD'
+#!/bin/sh
+enabled=/etc/space-link/traffic-guard.enabled
+hold=/etc/space-link/traffic-guard.hold
+
+guard_present() { nft list table inet space_link_guard >/dev/null 2>&1; }
+load_guard() {
+  guard_present && return 0
+  nft -f /etc/space-link/traffic-guard.nft
+}
+remove_guard() {
+  guard_present || return 0
+  nft delete table inet space_link_guard
+}
+path_ready() {
+  [ -f /etc/space-link/tproxy.armed ] || return 1
+  pidof sing-box >/dev/null 2>&1 || return 1
+  netstat -ln 2>/dev/null | grep -Eq '[:.]12345[[:space:]]' || return 1
+  nft list table inet space_link >/dev/null 2>&1
+}
+
+case "${1:-}" in
+  arm)
+    : > "$enabled" || exit 1
+    : > "$hold" || exit 1
+    load_guard || { rm -f "$hold"; exit 1; }
+    ;;
+  release)
+    [ -f "$enabled" ] && path_ready || exit 1
+    rm -f "$hold" || exit 1
+    remove_guard
+    ;;
+  off)
+    rm -f "$hold" "$enabled" || exit 1
+    remove_guard
+    ;;
+  sync)
+    if [ ! -f "$enabled" ]; then
+      remove_guard
+    elif [ -f "$hold" ]; then
+      load_guard
+    elif path_ready; then
+      remove_guard
+    else
+      load_guard
+    fi
+    ;;
+  status)
+    guard_present
+    ;;
+  *) exit 2 ;;
+esac
+GUARD
+  chmod 0755 /usr/bin/space-link-traffic-guard
+  cat > /etc/init.d/space-link-traffic-guard <<'INITD'
+#!/bin/sh /etc/rc.common
+START=10
+STOP=90
+start() { /usr/bin/space-link-traffic-guard sync; }
+reload() { /usr/bin/space-link-traffic-guard sync; }
+# Shutdown cannot briefly expose WAN traffic while LAN is still forwarding.
+stop() { :; }
+INITD
+  chmod 0755 /etc/init.d/space-link-traffic-guard
+  /etc/init.d/space-link-traffic-guard enable >/dev/null 2>&1 || true
+  if [ -s /etc/space-link/active-server ] \
+     && ! grep -Eq '"reason"[[:space:]]*:[[:space:]]*"user"' /etc/space-link/watchdog.json 2>/dev/null; then
+    /usr/bin/space-link-traffic-guard arm || die "Не удалось закрыть прямой выход во время обновления VPN"
+  else
+    /usr/bin/space-link-traffic-guard off || true
+  fi
+  ok "Защита трафика при восстановлении настроена"
 }
 
 # The active config must be valid, the process stable, and the transparent
@@ -1907,6 +2017,7 @@ activate_traffic_path() {
   if [ -f /etc/space-link/tproxy.armed ] \
      && traffic_engine_ready \
      && nft list table inet space_link >/dev/null 2>&1; then
+    /usr/bin/space-link-traffic-guard release || die "TPROXY готов, но не удалось снять временную защиту трафика"
     ok "TPROXY уже активен и прошёл проверку"
     return 0
   fi
@@ -1939,7 +2050,7 @@ activate_traffic_path() {
     if [ -x /usr/bin/space-link-dns ]; then
       /usr/bin/space-link-dns disable >/dev/null 2>&1 || true
     fi
-    warn "sing-box или :12345 не готовы — TPROXY выключен, интернет оставлен напрямую"
+    warn "sing-box или :12345 не готовы — роутер ждёт восстановления, трафик из LAN не выпускается напрямую"
     return 0
   fi
 
@@ -1947,6 +2058,7 @@ activate_traffic_path() {
   /etc/init.d/space-link-tproxy enable >/dev/null 2>&1 || true
   if /etc/init.d/space-link-tproxy start >/dev/null 2>&1 \
      && nft list table inet space_link >/dev/null 2>&1; then
+    /usr/bin/space-link-traffic-guard release || die "TPROXY готов, но не удалось снять временную защиту трафика"
     clear_stale_kill_switch
     ok "TPROXY активирован после проверки sing-box"
     return 0
@@ -1958,7 +2070,7 @@ activate_traffic_path() {
   if [ -x /usr/bin/space-link-dns ]; then
     /usr/bin/space-link-dns disable >/dev/null 2>&1 || true
   fi
-  warn "TPROXY не применился — интернет оставлен напрямую"
+  warn "TPROXY не применился — роутер ждёт восстановления, трафик из LAN не выпускается напрямую"
 }
 
 # ---- enable services -------------------------------------------------------
@@ -3234,6 +3346,9 @@ if [ -s /etc/space-link/active-server ] && pidof sing-box >/dev/null 2>&1 \
     /etc/init.d/space-link-tproxy start >/dev/null 2>&1 || /etc/init.d/space-link-tproxy reload >/dev/null 2>&1 || true
   fi
 fi
+if [ -x /usr/bin/space-link-traffic-guard ]; then
+  /usr/bin/space-link-traffic-guard sync >/dev/null 2>&1 || log "Не удалось восстановить защиту трафика при переподключении"
+fi
 
 # DNS pinning self-heal, fail-open. The redirect funnels every LAN query into
 # our resolver, so a dead dnsmasq would take the whole network's DNS with it.
@@ -3354,7 +3469,7 @@ final_summary() {
         nas_missing="${nas_missing:+$nas_missing, }$pkg"
       fi
     done
-    printf '   NAS/USB-пакеты:  %s из %s установлено' "$nas_installed" "$nas_total"
+    printf '   USB/DLNA-пакеты:  %s из %s установлено' "$nas_installed" "$nas_total"
     if [ -n "$nas_missing" ]; then
       printf ' (не удалось: %s)' "$nas_missing"
     fi
@@ -3476,8 +3591,11 @@ fi
 # Снапшот рабочих конфигов ДО любых правок — для отката если что-то пойдёт не так.
 mkdir -p "$BACKUP_DIR" 2>/dev/null || true
 backup_uci_state
-# Package upgrades may restart sing-box. Remove interception before touching
-# packages so LAN remains on direct WAN throughout the entire update window.
+# On an upgrade from a release without the guard, install and arm it before
+# tearing down interception or upgrading packages.
+configure_traffic_guard
+# Package upgrades may restart sing-box. Keep LAN forwarding guarded while
+# interception is removed and until the new engine is ready.
 disarm_traffic_path
 # Если dnsmasq уже лежит от прошлой кривой установки или ручных правок — чиним.
 ensure_dnsmasq_alive
@@ -3493,6 +3611,7 @@ configure_panel_ip
 install_templates
 save_state
 configure_tproxy
+configure_traffic_guard
 install_panel_watchdog
 enable_services
 configure_dns
